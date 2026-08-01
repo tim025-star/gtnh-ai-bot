@@ -3,7 +3,7 @@
 bin/
 build/
 run/
-config/
+/config/
 logs/
 crash-reports/
 scripts/__pycache__/
