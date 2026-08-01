@@ -1,4 +1,5 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -36,13 +37,18 @@ export class CodexAppServer {
 
 	async start() {
 		if (this.process) return;
+		const appDataRoot =
+			env.APP_DATA_DIR ??
+			join(process.env.LOCALAPPDATA ?? process.cwd(), "GTNH AI Bot");
+		const codexHome = join(appDataRoot, "codex-home");
+		await mkdir(codexHome, { recursive: true });
 		const require = createRequire(import.meta.url);
 		const packageJson = require.resolve("@openai/codex/package.json");
 		const codexScript =
 			env.CODEX_PATH ?? join(dirname(packageJson), "bin", "codex.js");
 		this.process = spawn(process.execPath, [codexScript, "app-server"], {
 			stdio: ["pipe", "pipe", "pipe"],
-			env: { ...process.env },
+			env: { ...process.env, CODEX_HOME: codexHome },
 			windowsHide: true,
 		});
 		this.process.on("exit", (code) =>

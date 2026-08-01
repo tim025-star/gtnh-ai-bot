@@ -27,15 +27,16 @@ export class RuntimeService {
 	readonly knowledge = new KnowledgeService();
 	private active: ActiveRun | null = null;
 	private ready: Promise<void>;
-	private readonly dataDir: string;
+	private readonly agentWorkspace: string;
 
 	constructor() {
-		this.dataDir =
+		const dataDir =
 			env.APP_DATA_DIR ??
 			join(process.env.LOCALAPPDATA ?? process.cwd(), "GTNH AI Bot");
+		this.agentWorkspace = join(dataDir, "agent-workspace");
 		this.ready = Promise.all([
 			ensureDatabase(),
-			mkdir(this.dataDir, { recursive: true }),
+			mkdir(this.agentWorkspace, { recursive: true }),
 		]).then(() => undefined);
 	}
 
@@ -207,7 +208,10 @@ export class RuntimeService {
 			if (!run) throw new Error("Goal run disappeared");
 			let threadId = run.codexThreadId;
 			if (!threadId) {
-				threadId = await this.codex.startThread(config.model, this.dataDir);
+				threadId = await this.codex.startThread(
+					config.model,
+					this.agentWorkspace,
+				);
 				await db
 					.update(goalRuns)
 					.set({ codexThreadId: threadId, updatedAt: new Date() })
