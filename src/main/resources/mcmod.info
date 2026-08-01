@@ -1,0 +1,25 @@
+{
+  "modListVersion": 2,
+  "modList": [
+    {
+      "modid": "${modId}",
+      "name": "${modName}",
+      "description": "Local-first GTNH 1.7.10 automation bot with authenticated web and in-game controls.",
+      "version": "${modVersion}",
+      "mcversion": "${minecraftVersion}",
+      "url": "",
+      "updateUrl": "",
+      "authorList": [
+        "Not_tambok"
+      ],
+      "credits": "Scaffolded by Codex",
+      "logoFile": "",
+      "screenshots": [],
+      "parent": "",
+      "requiredMods": [],
+      "dependencies": [],
+      "dependants": [],
+      "useDependencyInformation": false
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+	"name": "companion",
+	"private": true,
+	"workspaces": [
+		"apps/*",
+		"packages/*"
+	],
+	"type": "module",
+	"scripts": {
+		"dev": "pnpm -r dev",
+		"build": "pnpm -r build",
+		"test": "pnpm -r --if-present test",
+		"check-types": "pnpm -r check-types",
+		"dev:web": "pnpm --filter web dev",
+		"dev:server": "pnpm --filter server dev",
+		"db:push": "pnpm --filter @companion/db db:push",
+		"db:studio": "pnpm --filter @companion/db db:studio",
+		"db:generate": "pnpm --filter @companion/db db:generate",
+		"db:migrate": "pnpm --filter @companion/db db:migrate",
+		"db:local": "pnpm --filter @companion/db db:local",
+		"check": "biome check .",
+		"format": "biome check --write ."
+	},
+	"dependencies": {
+		"@companion/env": "workspace:*",
+		"dotenv": "catalog:",
+		"zod": "catalog:"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.6",
+		"@companion/config": "workspace:*",
+		"@types/node": "catalog:",
+		"typescript": "catalog:"
+	},
+	"packageManager": "pnpm@11.9.0"
+}

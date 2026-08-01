@@ -1,0 +1,32 @@
+{
+	"name": "server",
+	"type": "module",
+	"main": "src/index.ts",
+	"scripts": {
+		"build": "tsdown",
+		"check-types": "tsc -b",
+		"compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
+		"dev": "tsx watch src/index.ts",
+		"start": "node dist/index.mjs"
+	},
+	"dependencies": {
+		"@companion/api": "workspace:*",
+		"@companion/db": "workspace:*",
+		"@companion/env": "workspace:*",
+		"@hono/node-server": "^2.0.12",
+		"@hono/trpc-server": "^0.4.2",
+		"@libsql/win32-x64-msvc": "0.5.29",
+		"@openai/codex": "0.146.0",
+		"@trpc/server": "catalog:",
+		"dotenv": "catalog:",
+		"hono": "catalog:",
+		"zod": "catalog:"
+	},
+	"devDependencies": {
+		"@companion/config": "workspace:*",
+		"@types/node": "catalog:",
+		"tsdown": "^0.22.14",
+		"tsx": "^4.23.1",
+		"typescript": "catalog:"
+	}
+}

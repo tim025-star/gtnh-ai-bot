@@ -1,0 +1,32 @@
+{
+	"name": "@companion/api",
+	"type": "module",
+	"exports": {
+		".": {
+			"default": "./src/index.ts"
+		},
+		"./*": {
+			"default": "./src/*.ts"
+		}
+	},
+	"scripts": {
+		"test": "vitest run",
+		"check-types": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@companion/db": "workspace:*",
+		"@companion/env": "workspace:*",
+		"@openai/codex": "0.146.0",
+		"@trpc/client": "catalog:",
+		"@trpc/server": "catalog:",
+		"dotenv": "catalog:",
+		"drizzle-orm": "0.45.2",
+		"zod": "catalog:"
+	},
+	"devDependencies": {
+		"@companion/config": "workspace:*",
+		"hono": "catalog:",
+		"typescript": "catalog:",
+		"vitest": "^4.1.10"
+	}
+}
