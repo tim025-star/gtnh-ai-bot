@@ -12,13 +12,17 @@ import { desc, eq } from "drizzle-orm";
 import type { BotAction, BotSettings } from "../contracts";
 import { CodexAppServer } from "./codex";
 import { KnowledgeService } from "./knowledge";
-import { MinecraftClient } from "./minecraft";
+import { MinecraftClient, MinecraftHttpError } from "./minecraft";
 import { redactSecrets } from "./redact";
 
 type ActiveRun = {
 	id: string;
 	cancelled: boolean;
 	paused: boolean;
+	controller: AbortController;
+	initializing?: Promise<void>;
+	task?: Promise<void>;
+	client?: MinecraftClient;
 	extraInput?: string;
 };
 
@@ -98,72 +102,122 @@ export class RuntimeService {
 	}
 
 	async manualAction(action: BotAction) {
+		const client = await this.minecraft();
 		if (this.active)
 			throw new Error("Pause or cancel the active goal before manual control");
-		return (await this.minecraft()).action(action);
+		return client.action(action);
+	}
+
+	async manualActionStatus(id: string) {
+		return (await this.minecraft()).actionStatus(id);
 	}
 
 	async emergencyStop() {
-		if (this.active) this.active.cancelled = true;
-		const result = await (await this.minecraft()).stop();
-		if (this.active)
-			await this.finish(this.active.id, "cancelled", "Stopped by user");
-		this.active = null;
-		return result;
+		const active = this.active;
+		if (active) return this.stopRun(active, "cancelled", "Stopped by user");
+		return (await this.minecraft()).stop();
 	}
 
 	async startGoal(goal: string) {
-		await this.ready;
-		if (this.active) throw new Error("Only one goal can run at a time");
 		const id = randomUUID();
-		const now = new Date();
-		await db
-			.insert(goalRuns)
-			.values({ id, goal, status: "running", createdAt: now, updatedAt: now });
-		this.active = { id, cancelled: false, paused: false };
-		await this.event(id, "goal", "Goal approved and started");
-		void this.runLoop(this.active);
-		return this.getRun(id);
+		const active = this.reserveRun(id);
+		try {
+			active.initializing = (async () => {
+				await this.ready;
+				const now = new Date();
+				await db.insert(goalRuns).values({
+					id,
+					goal,
+					status: "running",
+					createdAt: now,
+					updatedAt: now,
+				});
+				await this.event(id, "goal", "Goal approved and started");
+			})();
+			await active.initializing;
+			active.task = this.runLoop(active);
+			return await this.getRun(id);
+		} catch (error) {
+			if (this.active === active) this.active = null;
+			throw error;
+		}
 	}
 
 	async pauseGoal(id: string) {
 		if (!this.active || this.active.id !== id)
 			throw new Error("Goal is not running");
-		this.active.paused = true;
-		await (await this.minecraft()).stop();
-		await this.finish(id, "paused", "Paused by user");
-		this.active = null;
+		await this.stopRun(this.active, "paused", "Paused by user");
 		return this.getRun(id);
 	}
 
 	async resumeGoal(id: string, userInput?: string) {
-		if (this.active) throw new Error("Another goal is active");
-		const run = await this.getRun(id);
-		if (!run || !["paused", "interrupted", "waiting_user"].includes(run.status))
-			throw new Error("Goal cannot be resumed");
-		await db
-			.update(goalRuns)
-			.set({ status: "running", error: null, updatedAt: new Date() })
-			.where(eq(goalRuns.id, id));
-		this.active = {
-			id,
-			cancelled: false,
-			paused: false,
-			extraInput: userInput?.slice(0, 500),
-		};
-		await this.event(id, "goal", "Goal resumed");
-		void this.runLoop(this.active);
-		return this.getRun(id);
+		const active = this.reserveRun(id, userInput);
+		try {
+			active.initializing = (async () => {
+				const run = await this.getRun(id);
+				if (
+					!run ||
+					!["paused", "interrupted", "waiting_user"].includes(run.status)
+				)
+					throw new Error("Goal cannot be resumed");
+				await db
+					.update(goalRuns)
+					.set({ status: "running", error: null, updatedAt: new Date() })
+					.where(eq(goalRuns.id, id));
+				await this.event(id, "goal", "Goal resumed");
+			})();
+			await active.initializing;
+			active.task = this.runLoop(active);
+			return await this.getRun(id);
+		} catch (error) {
+			if (this.active === active) this.active = null;
+			throw error;
+		}
 	}
 
 	async cancelGoal(id: string) {
-		if (this.active?.id === id) this.active.cancelled = true;
-		try {
-			await (await this.minecraft()).stop();
-		} catch {}
-		await this.finish(id, "cancelled", "Cancelled by user");
-		if (this.active?.id === id) this.active = null;
+		const active = this.active;
+		if (active?.id === id) {
+			await this.stopRun(active, "cancelled", "Cancelled by user");
+		} else {
+			const run = await this.getRun(id);
+			if (run && ["paused", "interrupted", "waiting_user"].includes(run.status))
+				await this.finish(id, "cancelled", "Cancelled by user");
+		}
 		return this.getRun(id);
+	}
+
+	private reserveRun(id: string, userInput?: string): ActiveRun {
+		if (this.active) throw new Error("Only one goal can run at a time");
+		const active: ActiveRun = {
+			id,
+			cancelled: false,
+			paused: false,
+			controller: new AbortController(),
+			extraInput: userInput?.slice(0, 500),
+		};
+		this.active = active;
+		return active;
+	}
+
+	private async stopRun(
+		active: ActiveRun,
+		status: "paused" | "cancelled",
+		message: string,
+	) {
+		if (active.paused || active.cancelled)
+			throw new Error("Goal is already stopping");
+		active.paused = status === "paused";
+		active.cancelled = status === "cancelled";
+		active.controller.abort(new Error(message));
+		try {
+			await active.initializing;
+			await active.task;
+			return await (active.client ?? (await this.minecraft())).stop();
+		} finally {
+			await this.finish(active.id, status, message);
+			if (this.active === active) this.active = null;
+		}
 	}
 
 	async currentRun() {
@@ -202,8 +256,29 @@ export class RuntimeService {
 
 	private async runLoop(active: ActiveRun) {
 		const started = Date.now();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let actionDispatched = false;
+		let actionAccepted = false;
 		try {
 			const config = await this.rawSettings();
+			const client = new MinecraftClient(
+				config.minecraftUrl,
+				config.minecraftToken,
+			);
+			active.client = client;
+			timer = setTimeout(
+				() =>
+					active.controller.abort(new Error("Goal safety budget exhausted")),
+				config.maxSeconds * 1000,
+			);
+			const ensureRunning = () => {
+				active.controller.signal.throwIfAborted();
+				if (this.active !== active || active.cancelled || active.paused)
+					throw new Error("Goal interrupted");
+				if (Date.now() - started >= config.maxSeconds * 1000)
+					throw new Error("Goal safety budget exhausted");
+			};
+			ensureRunning();
 			let run = await this.getRun(active.id);
 			if (!run) throw new Error("Goal run disappeared");
 			let threadId = run.codexThreadId;
@@ -216,11 +291,18 @@ export class RuntimeService {
 					.update(goalRuns)
 					.set({ codexThreadId: threadId, updatedAt: new Date() })
 					.where(eq(goalRuns.id, active.id));
+			} else {
+				await this.codex.ensureThread(
+					threadId,
+					config.model,
+					this.agentWorkspace,
+				);
 			}
 			let previous = active.extraInput
 				? `User response: ${active.extraInput}`
 				: "No previous action.";
 			while (!active.cancelled && !active.paused) {
+				ensureRunning();
 				run = await this.getRun(active.id);
 				if (!run) throw new Error("Goal run disappeared");
 				if (
@@ -230,7 +312,11 @@ export class RuntimeService {
 				) {
 					throw new Error("Goal safety budget exhausted");
 				}
-				const snapshot = await (await this.minecraft()).snapshot();
+				const snapshot = await client.snapshot(active.controller.signal);
+				ensureRunning();
+				if (!snapshot.ok) throw new Error("Minecraft world is not connected");
+				if (!Number.isSafeInteger(snapshot.controlRevision))
+					throw new Error("Minecraft returned an invalid control revision");
 				if (snapshot.controlSource === "game") {
 					await this.finish(
 						active.id,
@@ -242,6 +328,7 @@ export class RuntimeService {
 				const knowledge = config.knowledgeEnabled
 					? await this.knowledge.search(run.goal).catch(() => [])
 					: [];
+				ensureRunning();
 				const prompt = [
 					`Goal: ${run.goal}`,
 					`Step: ${run.stepCount + 1}/${config.maxSteps}; actions: ${run.actionCount}/${config.maxActions}; seconds remaining: ${Math.max(0, config.maxSeconds - Math.floor((Date.now() - started) / 1000))}`,
@@ -254,7 +341,9 @@ export class RuntimeService {
 					threadId,
 					prompt,
 					config.reasoningEffort,
+					active.controller.signal,
 				);
+				ensureRunning();
 				await db
 					.update(goalRuns)
 					.set({ stepCount: run.stepCount + 1, updatedAt: new Date() })
@@ -277,25 +366,117 @@ export class RuntimeService {
 					decision.rationale,
 					decision.action,
 				);
-				const result = await (await this.minecraft()).action(decision.action);
+				ensureRunning();
+				actionDispatched = true;
+				actionAccepted = false;
+				const result = await client.action(
+					decision.action,
+					undefined,
+					active.controller.signal,
+					snapshot.controlRevision as number,
+				);
+				actionAccepted = true;
 				await db
 					.update(goalRuns)
 					.set({ actionCount: run.actionCount + 1, updatedAt: new Date() })
 					.where(eq(goalRuns.id, active.id));
-				previous = JSON.stringify(result);
 				await this.event(
 					active.id,
 					"action",
-					`${decision.action.type} accepted by Minecraft`,
+					`${decision.action.type} accepted by Minecraft as ${result.action.id}`,
 					result,
 				);
-				await new Promise((resolve) => setTimeout(resolve, 750));
+				const terminal = await this.waitForMinecraftAction(
+					active,
+					result.action.id,
+					started,
+					config.maxSeconds,
+					client,
+				);
+				actionDispatched = false;
+				if (terminal.status === "cancelled")
+					throw new Error("Minecraft action was cancelled");
+				previous = JSON.stringify(terminal);
+				await this.event(
+					active.id,
+					"action_result",
+					`${decision.action.type} ${terminal.status}: ${terminal.message}`,
+					terminal,
+				);
 			}
 		} catch (error) {
-			if (!active.cancelled && !active.paused)
-				await this.finish(active.id, "failed", redactSecrets(error));
+			if (!active.cancelled && !active.paused) {
+				const rejected =
+					!actionAccepted &&
+					error instanceof MinecraftHttpError &&
+					error.status < 500;
+				if (actionDispatched && !rejected && active.client) {
+					try {
+						await active.client.stop();
+					} catch (stopError) {
+						await this.event(
+							active.id,
+							"stop_failed",
+							redactSecrets(stopError),
+						);
+					}
+				}
+				await this.finish(
+					active.id,
+					rejected && error.status === 409 ? "interrupted" : "failed",
+					redactSecrets(error),
+				);
+			}
 		} finally {
-			if (this.active === active) this.active = null;
+			clearTimeout(timer);
+			if (this.active === active && !active.paused && !active.cancelled)
+				this.active = null;
+		}
+	}
+
+	private async waitForMinecraftAction(
+		active: ActiveRun,
+		actionId: string,
+		started: number,
+		maxSeconds: number,
+		client: MinecraftClient,
+	) {
+		let lastPhase = "";
+		while (true) {
+			if (active.cancelled || active.paused)
+				throw new Error("Minecraft action interrupted");
+			if (Date.now() - started > maxSeconds * 1000)
+				throw new Error("Goal safety budget exhausted during Minecraft action");
+			active.controller.signal.throwIfAborted();
+			const response = await client.actionStatus(
+				actionId,
+				active.controller.signal,
+			);
+			const action = response.action;
+			if (["completed", "failed", "cancelled"].includes(action.status))
+				return action;
+			if (action.phase !== lastPhase) {
+				lastPhase = action.phase;
+				await this.event(
+					active.id,
+					"action_progress",
+					`${action.type}: ${action.phase} - ${action.message}`,
+					action,
+				);
+			}
+			await new Promise<void>((resolve, reject) => {
+				const signal = active.controller.signal;
+				const abort = () => {
+					clearTimeout(timer);
+					reject(signal.reason);
+				};
+				const timer = setTimeout(() => {
+					signal.removeEventListener("abort", abort);
+					resolve();
+				}, 250);
+				signal.addEventListener("abort", abort, { once: true });
+				if (signal.aborted) abort();
+			});
 		}
 	}
 

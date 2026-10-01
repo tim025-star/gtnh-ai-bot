@@ -64,6 +64,10 @@ The dashboard supports natural-language goals and typed manual actions. The in-g
 
 Only one web goal runs at a time. Every goal has independently enforced step, action, and wall-clock budgets. Pause, cancel, and emergency stop remain available while a goal is running.
 
+The companion waits for each Minecraft action to complete before planning the next step. Manual actions report completion or failure through dashboard notifications. An in-game command interrupts AI control, including a decision that was still being planned.
+
+Crafting uses exact registry IDs, for example `/gtnhbot craft minecraft:stick 4`. The count is the desired total in the player's inventory. The bot resolves loaded recipes and dependencies, retrieves ingredients from nearby chests, and uses the player grid or a nearby vanilla crafting table. It checks observed inventory results after standard Minecraft container clicks. Furnace and GregTech recipes are indexed for diagnosis; their machine executors are not implemented.
+
 ## Development checks
 
 ```powershell
@@ -81,6 +85,7 @@ See [Architecture](docs/ARCHITECTURE.md), [Contributing](CONTRIBUTING.md), and [
 
 - V1 controls one local Minecraft client.
 - Pathfinding handles ordinary walkable terrain; it is not a full tunnelling or bridging implementation.
+- Automatic crafting executes player-grid and vanilla crafting-table recipes. Machine crafting and custom workbench containers are not supported.
 - GTNH wiki results are advisory and are passed to the model as untrusted reference data.
 - ChatGPT access depends on the user's Codex entitlement, workspace policy, and usage limits.
 - A real GTNH gameplay smoke test is required before the first public binary release.

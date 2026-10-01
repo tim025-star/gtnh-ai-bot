@@ -6,8 +6,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.concurrent.Callable;
 
 import com.google.gson.JsonElement;
@@ -23,13 +21,6 @@ public class BotControlServer {
     private static final int MAX_BODY_BYTES = 64 * 1024;
     private final ClientBotController controller;
     private final PairingManager pairing;
-    private final Map<String, String> completedActions = new LinkedHashMap<String, String>() {
-
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
-            return size() > 500;
-        }
-    };
     private HttpServer httpServer;
 
     public BotControlServer(ClientBotController controller, PairingManager pairing) {
@@ -105,6 +96,20 @@ public class BotControlServer {
                     }));
                     return;
                 }
+                if (path.startsWith("/v1/actions/") && "GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    final String actionId = path.substring("/v1/actions/".length());
+                    if (actionId.length() < 8 || actionId.length() > 100) throw new BadRequest(400, "Invalid actionId");
+                    String status = controller.callOnClientThread(new Callable<String>() {
+
+                        @Override
+                        public String call() {
+                            return controller.trackedActionJson(actionId);
+                        }
+                    });
+                    if (status == null) writeError(exchange, 404, "Action not found");
+                    else writeJson(exchange, 200, status);
+                    return;
+                }
                 requireJsonPost(exchange);
                 if ("/v1/stop".equals(path)) {
                     writeJson(exchange, 200, controller.callOnClientThread(new Callable<String>() {
@@ -121,12 +126,6 @@ public class BotControlServer {
                     final JsonObject body = readJson(exchange);
                     final String actionId = string(body, "actionId");
                     if (actionId.length() < 8 || actionId.length() > 100) throw new BadRequest(400, "Invalid actionId");
-                    synchronized (completedActions) {
-                        if (completedActions.containsKey(actionId)) {
-                            writeJson(exchange, 200, completedActions.get(actionId));
-                            return;
-                        }
-                    }
                     final JsonObject action = object(body, "action");
                     String result = controller.callOnClientThread(new Callable<String>() {
 
@@ -135,9 +134,6 @@ public class BotControlServer {
                             return executeAction(actionId, action);
                         }
                     });
-                    synchronized (completedActions) {
-                        completedActions.put(actionId, result);
-                    }
                     writeJson(exchange, 200, result);
                     return;
                 }
@@ -150,16 +146,35 @@ public class BotControlServer {
         }
     }
 
-    private String executeAction(String actionId, JsonObject action) {
+    String executeAction(String actionId, JsonObject action) {
+        if (!actionId.matches("[A-Za-z0-9-]{8,100}")) throw new BadRequest(400, "Invalid actionId");
+        String existing = controller.trackedActionJson(actionId);
+        if (existing != null) return existing;
+        if (action.has("expectedControlRevision")) {
+            long revision;
+            try {
+                revision = action.get("expectedControlRevision")
+                    .getAsBigDecimal()
+                    .longValueExact();
+            } catch (Exception ex) {
+                throw new BadRequest(400, "Invalid control revision");
+            }
+            if (!controller.hasControlRevision(revision))
+                throw new BadRequest(409, "Minecraft control changed while planning");
+        }
         String type = string(action, "type");
         String result;
         if ("goto".equals(type) || "break".equals(type)) {
-            result = controller
-                .enqueueFromWeb(type + " " + coordinate(action, "x") + " " + y(action) + " " + coordinate(action, "z"));
+            result = controller.enqueueFromWeb(
+                actionId,
+                type,
+                type + " " + coordinate(action, "x") + " " + y(action) + " " + coordinate(action, "z"));
         } else if ("follow".equals(type)) {
-            result = controller.enqueueFromWeb("follow " + limitedString(action, "player", 32));
+            result = controller.enqueueFromWeb(actionId, type, "follow " + limitedString(action, "player", 32));
         } else if ("use".equals(type) || "place".equals(type)) {
             result = controller.enqueueFromWeb(
+                actionId,
+                type,
                 type + " "
                     + coordinate(action, "x")
                     + " "
@@ -170,15 +185,21 @@ public class BotControlServer {
                     + boundedInt(action, "side", 0, 5));
         } else if ("craft".equals(type)) {
             result = controller.enqueueFromWeb(
+                actionId,
+                type,
                 "craft " + limitedString(action, "item", 160) + " " + boundedInt(action, "count", 1, 64));
         } else if ("selectItem".equals(type)) {
-            result = controller.holdItem(limitedString(action, "item", 160));
+            result = controller
+                .completeImmediateAction(actionId, type, controller.holdItem(limitedString(action, "item", 160)));
         } else if ("diagnose".equals(type)) {
-            result = controller.diagnose(limitedString(action, "query", 160));
+            String query = string(action, "query");
+            if (query.length() > 160 || query.indexOf('\n') >= 0 || query.indexOf('\r') >= 0)
+                throw new BadRequest(400, "query is invalid");
+            result = controller.completeImmediateAction(actionId, type, controller.diagnose(query));
         } else {
             throw new BadRequest(400, "Unknown action type");
         }
-        return "{\"ok\":true,\"actionId\":\"" + escape(actionId) + "\",\"result\":\"" + escape(result) + "\"}";
+        return result;
     }
 
     private boolean authenticate(HttpExchange exchange) {
@@ -242,8 +263,13 @@ public class BotControlServer {
 
     private static int boundedInt(JsonObject object, String key, int min, int max) {
         try {
-            int value = object.get(key)
-                .getAsInt();
+            JsonElement input = object.get(key);
+            if (input == null || !input.isJsonPrimitive()
+                || !input.getAsJsonPrimitive()
+                    .isNumber())
+                throw new BadRequest(400, key + " must be an integer");
+            int value = input.getAsBigDecimal()
+                .intValueExact();
             if (value < min || value > max) throw new BadRequest(400, key + " is out of range");
             return value;
         } catch (BadRequest ex) {
@@ -283,7 +309,7 @@ public class BotControlServer {
         output.close();
     }
 
-    private static class BadRequest extends RuntimeException {
+    private static class BadRequest extends IllegalArgumentException {
 
         private final int status;
 

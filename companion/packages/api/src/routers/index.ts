@@ -37,6 +37,9 @@ export const appRouter = router({
 		action: publicProcedure
 			.input(botActionSchema)
 			.mutation(({ input }) => runtime.manualAction(input)),
+		actionStatus: publicProcedure
+			.input(idInput)
+			.query(({ input }) => runtime.manualActionStatus(input.id)),
 		stop: publicProcedure.mutation(() => runtime.emergencyStop()),
 	}),
 	goals: router({

@@ -96,6 +96,12 @@ function Dashboard() {
 	const [pairCode, setPairCode] = useState("");
 	const [apiKey, setApiKey] = useState("");
 	const [goal, setGoal] = useState("");
+	const [manualActionId, setManualActionId] = useState<string | null>(null);
+	const manualStatus = useQuery({
+		...trpc.bot.actionStatus.queryOptions({ id: manualActionId ?? "00000000" }),
+		enabled: manualActionId !== null,
+		refetchInterval: 1_000,
+	});
 	const [actionType, setActionType] = useState("goto");
 	const [actionArgs, setActionArgs] = useState({
 		x: "0",
@@ -165,11 +171,29 @@ function Dashboard() {
 		"Emergency stop sent",
 		refresh,
 	);
-	const manual = useActionMutation(
-		trpc.bot.action.mutationOptions(),
-		"Action accepted",
-		refresh,
+	const manual = useMutation(
+		trpc.bot.action.mutationOptions({
+			onSuccess: async (result) => {
+				setManualActionId(result.action.id);
+				toast.success("Action accepted");
+				await refresh();
+			},
+		}),
 	);
+	useEffect(() => {
+		if (!manualActionId) return;
+		if (manualStatus.error) {
+			setManualActionId(null);
+			return;
+		}
+		const action = manualStatus.data?.action;
+		if (!action || action.id !== manualActionId) return;
+		if (action.status === "completed") toast.success(action.message);
+		else if (action.status === "failed" || action.status === "cancelled")
+			toast.error(action.message);
+		else return;
+		setManualActionId(null);
+	}, [manualActionId, manualStatus.data, manualStatus.error]);
 	const saveSettings = useActionMutation(
 		trpc.settings.update.mutationOptions(),
 		"Settings saved",
@@ -250,13 +274,15 @@ function Dashboard() {
 								className={`${field} min-h-28 resize-y`}
 								value={goal}
 								onChange={(e) => setGoal(e.target.value)}
-								placeholder="Craft an LV lathe, using nearby storage and machines."
+								placeholder="Craft four sticks using nearby storage."
 							/>
 							<div className="mt-3 flex gap-2">
 								<button
 									type="button"
 									className={`${button} bg-emerald-400 text-emerald-950 hover:bg-emerald-300`}
-									disabled={active || goal.trim().length < 3}
+									disabled={
+										active || manualActionId !== null || goal.trim().length < 3
+									}
 									onClick={() => startGoal.mutate({ goal })}
 								>
 									<Send className="h-4 w-4" />
@@ -433,7 +459,7 @@ function Dashboard() {
 							<button
 								type="button"
 								className={`${button} mt-3 bg-white/10 text-white hover:bg-white/15`}
-								disabled={active}
+								disabled={active || manual.isPending || manualActionId !== null}
 								onClick={sendManual}
 							>
 								Send action

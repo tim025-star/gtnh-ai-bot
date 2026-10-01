@@ -7,7 +7,7 @@ import { env } from "@companion/env/server";
 import {
 	type AgentDecision,
 	agentDecisionJsonSchema,
-	agentDecisionSchema,
+	parseAgentDecision,
 } from "../contracts";
 import { redactSecrets } from "./redact";
 
@@ -22,6 +22,9 @@ const BOT_INSTRUCTIONS =
 
 export class CodexAppServer {
 	private process: ChildProcessWithoutNullStreams | null = null;
+	private starting: Promise<void> | null = null;
+	private loadedThreads = new Set<string>();
+	private ignoredTurns = new Set<string>();
 	private nextId = 1;
 	private pending = new Map<number, Pending>();
 	private finalMessages = new Map<string, string>();
@@ -32,11 +35,22 @@ export class CodexAppServer {
 			resolve: (value: string) => void;
 			reject: (error: Error) => void;
 			timer: NodeJS.Timeout;
+			cleanup: () => void;
 		}
 	>();
 
 	async start() {
+		if (this.starting) return this.starting;
 		if (this.process) return;
+		this.starting = this.startProcess();
+		try {
+			await this.starting;
+		} finally {
+			this.starting = null;
+		}
+	}
+
+	private async startProcess() {
 		const appDataRoot =
 			env.APP_DATA_DIR ??
 			join(process.env.LOCALAPPDATA ?? process.cwd(), "GTNH AI Bot");
@@ -46,29 +60,43 @@ export class CodexAppServer {
 		const packageJson = require.resolve("@openai/codex/package.json");
 		const codexScript =
 			env.CODEX_PATH ?? join(dirname(packageJson), "bin", "codex.js");
-		this.process = spawn(process.execPath, [codexScript, "app-server"], {
+		const child = spawn(process.execPath, [codexScript, "app-server"], {
 			stdio: ["pipe", "pipe", "pipe"],
 			env: { ...process.env, CODEX_HOME: codexHome },
 			windowsHide: true,
 		});
-		this.process.on("exit", (code) =>
-			this.failAll(new Error(`Codex app-server exited (${code ?? "unknown"})`)),
-		);
-		this.process.stderr.on("data", (chunk) => {
+		this.process = child;
+		child.on("error", (error) => {
+			if (this.process === child) this.failAll(error);
+		});
+		child.on("exit", (code) => {
+			if (this.process === child)
+				this.failAll(
+					new Error(`Codex app-server exited (${code ?? "unknown"})`),
+				);
+		});
+		child.stderr.on("data", (chunk) => {
 			const safe = redactSecrets(chunk.toString());
 			if (safe.trim()) console.error(`[codex] ${safe}`);
 		});
-		const lines = createInterface({ input: this.process.stdout });
+		const lines = createInterface({ input: child.stdout });
 		lines.on("line", (line) => this.onMessage(line));
-		await this.request("initialize", {
-			clientInfo: {
-				name: "gtnh-ai-bot",
-				title: "GTNH AI Bot",
-				version: "0.1.0",
-			},
-			capabilities: { experimentalApi: false },
-		});
-		this.notify("initialized", {});
+		try {
+			await this.request("initialize", {
+				clientInfo: {
+					name: "gtnh-ai-bot",
+					title: "GTNH AI Bot",
+					version: "0.1.0",
+				},
+				capabilities: { experimentalApi: false },
+			});
+			this.notify("initialized", {});
+		} catch (error) {
+			child.kill();
+			if (this.process === child)
+				this.failAll(error instanceof Error ? error : new Error(String(error)));
+			throw error;
+		}
 	}
 
 	async account() {
@@ -125,15 +153,34 @@ export class CodexAppServer {
 		});
 		const threadId = result?.thread?.id;
 		if (!threadId) throw new Error("Codex did not return a thread id");
-		return String(threadId);
+		const id = String(threadId);
+		this.loadedThreads.add(id);
+		return id;
+	}
+
+	async ensureThread(threadId: string, model: string | null, cwd: string) {
+		await this.start();
+		if (this.loadedThreads.has(threadId)) return;
+		await this.request("thread/resume", {
+			threadId,
+			cwd,
+			model,
+			approvalPolicy: "never",
+			sandbox: "read-only",
+			developerInstructions: BOT_INSTRUCTIONS,
+		});
+		this.loadedThreads.add(threadId);
 	}
 
 	async runDecision(
 		threadId: string,
 		prompt: string,
 		effort: string,
+		signal?: AbortSignal,
 	): Promise<AgentDecision> {
+		signal?.throwIfAborted();
 		await this.start();
+		signal?.throwIfAborted();
 		const result = await this.request("turn/start", {
 			threadId,
 			input: [{ type: "text", text: prompt }],
@@ -144,20 +191,46 @@ export class CodexAppServer {
 		});
 		const turnId = String(result?.turn?.id ?? "");
 		if (!turnId) throw new Error("Codex did not return a turn id");
+		if (signal?.aborted) {
+			this.ignoreAndInterrupt(threadId, turnId);
+			signal.throwIfAborted();
+		}
 		const alreadyCompleted = this.completedTurns.get(turnId);
 		if (alreadyCompleted) {
 			this.completedTurns.delete(turnId);
 			if (alreadyCompleted.error) throw new Error(alreadyCompleted.error);
-			return agentDecisionSchema.parse(JSON.parse(alreadyCompleted.text));
+			return parseAgentDecision(JSON.parse(alreadyCompleted.text));
 		}
 		const text = await new Promise<string>((resolve, reject) => {
-			const timer = setTimeout(() => {
+			const cleanup = () => {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", abort);
 				this.turnWaiters.delete(turnId);
-				reject(new Error("Codex turn timed out"));
+			};
+			const fail = (error: Error) => {
+				cleanup();
+				this.ignoreAndInterrupt(threadId, turnId);
+				reject(error);
+			};
+			const abort = () =>
+				fail(signal?.reason ?? new Error("Codex turn interrupted"));
+			const timer = setTimeout(() => {
+				fail(new Error("Codex turn timed out"));
 			}, 120_000);
-			this.turnWaiters.set(turnId, { resolve, reject, timer });
+			this.turnWaiters.set(turnId, { resolve, reject, timer, cleanup });
+			signal?.addEventListener("abort", abort, { once: true });
+			if (signal?.aborted) abort();
 		});
-		return agentDecisionSchema.parse(JSON.parse(text));
+		return parseAgentDecision(JSON.parse(text));
+	}
+
+	private ignoreAndInterrupt(threadId: string, turnId: string) {
+		this.ignoredTurns.add(turnId);
+		this.completedTurns.delete(turnId);
+		this.finalMessages.delete(turnId);
+		void this.request("turn/interrupt", { threadId, turnId }).catch(
+			() => undefined,
+		);
 	}
 
 	private request(method: string, params: unknown): Promise<any> {
@@ -201,17 +274,18 @@ export class CodexAppServer {
 			message.params?.item?.type === "agentMessage"
 		) {
 			const turnId = String(message.params.turnId ?? "");
-			this.finalMessages.set(turnId, String(message.params.item.text ?? ""));
+			if (!this.ignoredTurns.has(turnId))
+				this.finalMessages.set(turnId, String(message.params.item.text ?? ""));
 		}
 		if (message.method === "turn/completed") {
 			const turnId = String(
 				message.params?.turn?.id ?? message.params?.turnId ?? "",
 			);
 			const waiter = this.turnWaiters.get(turnId);
+			if (this.ignoredTurns.delete(turnId)) return;
 			const error = message.params?.turn?.error;
 			if (waiter) {
-				clearTimeout(waiter.timer);
-				this.turnWaiters.delete(turnId);
+				waiter.cleanup();
 				if (error)
 					waiter.reject(new Error(redactSecrets(error.message ?? error)));
 				else waiter.resolve(this.finalMessages.get(turnId) ?? "");
@@ -228,17 +302,19 @@ export class CodexAppServer {
 
 	private failAll(error: Error) {
 		this.process = null;
+		this.loadedThreads.clear();
 		for (const pending of this.pending.values()) {
 			clearTimeout(pending.timer);
 			pending.reject(error);
 		}
 		for (const waiter of this.turnWaiters.values()) {
-			clearTimeout(waiter.timer);
+			waiter.cleanup();
 			waiter.reject(error);
 		}
 		this.pending.clear();
 		this.turnWaiters.clear();
 		this.finalMessages.clear();
 		this.completedTurns.clear();
+		this.ignoredTurns.clear();
 	}
 }

@@ -15,7 +15,9 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Properties;
@@ -23,6 +25,7 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
@@ -31,35 +34,42 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityClientPlayerMP;
 import net.minecraft.client.gui.inventory.GuiChest;
 import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.inventory.ContainerPlayer;
+import net.minecraft.inventory.ContainerWorkbench;
 import net.minecraft.inventory.IInventory;
 import net.minecraft.inventory.ISidedInventory;
+import net.minecraft.inventory.InventoryLargeChest;
+import net.minecraft.inventory.Slot;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
-import net.minecraft.item.crafting.CraftingManager;
-import net.minecraft.item.crafting.IRecipe;
-import net.minecraft.item.crafting.ShapedRecipes;
-import net.minecraft.item.crafting.ShapelessRecipes;
 import net.minecraft.tileentity.TileEntity;
+import net.minecraft.tileentity.TileEntityChest;
 import net.minecraft.util.ChatComponentText;
 import net.minecraft.util.MathHelper;
 import net.minecraft.util.MovingObjectPosition;
 import net.minecraft.util.Vec3;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.Chunk;
-import net.minecraftforge.oredict.OreDictionary;
-import net.minecraftforge.oredict.ShapedOreRecipe;
-import net.minecraftforge.oredict.ShapelessOreRecipe;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
 import cpw.mods.fml.common.eventhandler.SubscribeEvent;
 import cpw.mods.fml.common.gameevent.TickEvent;
+import dev.nottambok.gtnhaibot.client.actions.TrackedAction;
+import dev.nottambok.gtnhaibot.client.crafting.CraftPlan;
+import dev.nottambok.gtnhaibot.client.crafting.CraftPlanner;
+import dev.nottambok.gtnhaibot.client.crafting.IngredientRequirement;
+import dev.nottambok.gtnhaibot.client.crafting.LiveRecipeIndex;
+import dev.nottambok.gtnhaibot.client.crafting.RecipeDefinition;
+import dev.nottambok.gtnhaibot.client.crafting.ResourceLedger;
+import dev.nottambok.gtnhaibot.client.crafting.StackKey;
 
 public class ClientBotController {
 
     private static final int PATH_RECALC_TICKS = 12;
     private static final int MAX_PATH_NODES = 4096;
+    private static final int MAX_INTERACTION_MOVE_TICKS = 600;
     private static final String GOAL_FILE = "config/gtnh-ai-bot-goals.properties";
     private static final String CHEST_CACHE_FILE = "config/gtnh-ai-bot-chest-cache.tsv";
     private static final int CHEST_SCAN_RADIUS_CHUNKS = 3;
@@ -75,6 +85,8 @@ public class ClientBotController {
     private static final int MAX_COLD_CONTEXT_LINES = 40;
 
     private final Queue<ClientTask> tasks = new ArrayDeque<ClientTask>();
+    private final LiveRecipeIndex recipeIndex = new LiveRecipeIndex();
+    private final Map<String, TrackedAction> trackedActions = new LinkedHashMap<String, TrackedAction>();
     private Queue<BlockPos> currentPath = new ArrayDeque<BlockPos>();
     private final Map<ChestKey, ChestSnapshot> chestCache = new HashMap<ChestKey, ChestSnapshot>();
     private final Map<String, Integer> cachedItemTotals = new HashMap<String, Integer>();
@@ -118,6 +130,54 @@ public class ClientBotController {
         return enqueue(commandLine);
     }
 
+    public synchronized String enqueueFromWeb(String actionId, String actionType, String commandLine) {
+        TrackedAction existing = trackedActions.get(actionId);
+        if (existing != null) return actionResponse(existing);
+        ParsedCommand parsed = parse(commandLine);
+        if (parsed.error != null) throw new IllegalArgumentException(parsed.error);
+        TrackedAction action = new TrackedAction(actionId, actionType);
+        recordAction(action);
+        if (parsed.task == null) {
+            action.complete("Action completed");
+        } else {
+            parsed.task.actionId = actionId;
+            tasks.add(parsed.task);
+            controlSource = "web";
+            controlRevision++;
+        }
+        return actionResponse(action);
+    }
+
+    public synchronized String completeImmediateAction(String actionId, String actionType, String result) {
+        TrackedAction existing = trackedActions.get(actionId);
+        if (existing != null) return actionResponse(existing);
+        TrackedAction action = new TrackedAction(actionId, actionType);
+        recordAction(action);
+        if ("selectItem".equals(actionType) && !result.startsWith("HELD ")) action.fail(result);
+        else action.complete(result);
+        return actionResponse(action);
+    }
+
+    public synchronized String trackedActionJson(String actionId) {
+        TrackedAction action = trackedActions.get(actionId);
+        return action == null ? null : actionResponse(action);
+    }
+
+    public synchronized boolean hasControlRevision(long revision) {
+        return controlRevision == revision;
+    }
+
+    private void recordAction(TrackedAction action) {
+        Iterator<TrackedAction> cached = trackedActions.values()
+            .iterator();
+        while (trackedActions.size() >= 500 && cached.hasNext()) {
+            if (cached.next()
+                .isTerminal()) cached.remove();
+        }
+        if (trackedActions.size() >= 500) throw new IllegalStateException("Too many pending Minecraft actions");
+        trackedActions.put(action.getId(), action);
+    }
+
     public synchronized String enqueueFromGame(String commandLine) {
         stopAll();
         controlSource = "game";
@@ -147,6 +207,16 @@ public class ClientBotController {
     }
 
     public synchronized void stopAll() {
+        Minecraft minecraft = Minecraft.getMinecraft();
+        if (minecraft != null && minecraft.thePlayer != null) {
+            clearOpenCraftingGrid(minecraft, minecraft.thePlayer);
+            if (minecraft.thePlayer.openContainer != minecraft.thePlayer.inventoryContainer)
+                minecraft.thePlayer.closeScreen();
+        }
+        for (ClientTask task : tasks) {
+            TrackedAction action = trackedAction(task);
+            if (action != null) action.cancel("Stopped by user");
+        }
         tasks.clear();
         currentPath.clear();
         lastGoal = null;
@@ -158,7 +228,15 @@ public class ClientBotController {
     public String callOnClientThread(Callable<String> call) throws Exception {
         FutureTask<String> task = new FutureTask<String>(call);
         apiCalls.add(task);
-        return task.get(5L, TimeUnit.SECONDS);
+        try {
+            return task.get(5L, TimeUnit.SECONDS);
+        } catch (ExecutionException ex) {
+            if (ex.getCause() instanceof Exception) throw (Exception) ex.getCause();
+            throw ex;
+        } finally {
+            if (!task.isDone()) task.cancel(false);
+            apiCalls.remove(task);
+        }
     }
 
     public synchronized String snapshotJson() {
@@ -170,6 +248,22 @@ public class ClientBotController {
         root.addProperty("controlRevision", controlRevision);
         root.addProperty("queuedTasks", tasks.size());
         root.addProperty("tasks", listTasks());
+        JsonObject index = new JsonObject();
+        index.addProperty(
+            "state",
+            recipeIndex.getState()
+                .name()
+                .toLowerCase());
+        index.addProperty("recipes", recipeIndex.size());
+        index.addProperty("fingerprint", recipeIndex.getFingerprint());
+        if (recipeIndex.getError()
+            .length() > 0) index.addProperty("error", recipeIndex.getError());
+        root.add("recipeIndex", index);
+        ClientTask activeTask = tasks.peek();
+        if (activeTask != null) {
+            TrackedAction activeAction = trackedAction(activeTask);
+            if (activeAction != null) root.add("activeAction", activeAction.toJson());
+        }
         if (!connected) return root.toString();
         root.addProperty("player", mc.thePlayer.getCommandSenderName());
         root.addProperty("x", MathHelper.floor_double(mc.thePlayer.posX));
@@ -333,12 +427,9 @@ public class ClientBotController {
             player.inventoryContainer.detectAndSendChanges();
             return "HELD " + stackKey(player.inventory.mainInventory[found]) + " slot=" + found;
         }
+        if (player.openContainer != player.inventoryContainer) player.closeScreen();
         int hotbarSlot = player.inventory.currentItem;
-        ItemStack inHand = player.inventory.mainInventory[hotbarSlot];
-        ItemStack selected = player.inventory.mainInventory[found];
-        player.inventory.mainInventory[hotbarSlot] = selected;
-        player.inventory.mainInventory[found] = inHand;
-        player.inventoryContainer.detectAndSendChanges();
+        mc.playerController.windowClick(player.inventoryContainer.windowId, found, hotbarSlot, 2, player);
         ItemStack now = player.inventory.mainInventory[hotbarSlot];
         return now == null ? "HOLD FAIL " + trimmed : "HELD " + stackKey(now) + " slot=" + hotbarSlot;
     }
@@ -356,6 +447,9 @@ public class ClientBotController {
     public synchronized String diagnose(String targetArg) {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc == null || mc.thePlayer == null || mc.theWorld == null) return "DIAG code=NO_WORLD";
+        String diagnosticArg = targetArg == null ? "" : targetArg.trim();
+        if (diagnosticArg.toLowerCase(Locale.ROOT)
+            .startsWith("recipe ")) return recipeIndex.describe(diagnosticArg.substring(7), 450);
         DiagnosticTarget target = resolveDiagnosticTarget(mc, targetArg);
         if (target == null) {
             return "DIAG code=TARGET_MISS recommend=\"refresh nearby; blocks <machine>\"";
@@ -771,16 +865,21 @@ public class ClientBotController {
         if (event.phase != TickEvent.Phase.END) {
             return;
         }
-        FutureTask<String> apiCall;
-        while ((apiCall = apiCalls.poll()) != null) {
-            apiCall.run();
-        }
+        processApiCalls();
         Minecraft mc = Minecraft.getMinecraft();
         if (mc == null || mc.thePlayer == null || mc.theWorld == null) {
+            synchronized (this) {
+                for (ClientTask pending : tasks) {
+                    TrackedAction action = trackedAction(pending);
+                    if (action != null) action.fail("Minecraft world disconnected");
+                }
+                stopAll();
+            }
             return;
         }
         tickBlockCache(mc);
         tickChestCache(mc);
+        recipeIndex.tick();
         ClientTask task;
         synchronized (this) {
             task = tasks.peek();
@@ -788,8 +887,26 @@ public class ClientBotController {
         if (task == null) {
             return;
         }
-        boolean keep = runTask(mc, task);
+        TrackedAction tracked = trackedAction(task);
+        if (tracked != null && tracked.getStatus() == TrackedAction.Status.ACCEPTED) tracked.running(
+            task.kind.name()
+                .toLowerCase(),
+            "Minecraft is executing the action");
+        boolean keep;
+        try {
+            keep = runTask(mc, task);
+        } catch (Exception ex) {
+            keep = false;
+            if (tracked != null) tracked.fail(
+                ex.getMessage() == null ? ex.getClass()
+                    .getSimpleName() : ex.getMessage());
+        }
         if (!keep) {
+            if (task.kind == TaskKind.CRAFT) {
+                clearOpenCraftingGrid(mc, mc.thePlayer);
+                if (mc.thePlayer.openContainer != mc.thePlayer.inventoryContainer) mc.thePlayer.closeScreen();
+            }
+            if (tracked != null && !tracked.isTerminal()) tracked.complete("Action completed in Minecraft");
             synchronized (this) {
                 tasks.poll();
                 currentPath.clear();
@@ -801,145 +918,696 @@ public class ClientBotController {
         }
     }
 
+    void processApiCalls() {
+        FutureTask<String> call;
+        while ((call = apiCalls.poll()) != null) call.run();
+    }
+
     private boolean runTask(Minecraft mc, ClientTask task) {
         EntityClientPlayerMP player = mc.thePlayer;
         if (task.kind == TaskKind.GOTO) {
-            return moveTo(mc, player, new BlockPos(task.x, task.y, task.z), 0.9D);
+            BlockPos target = new BlockPos(task.x, task.y, task.z);
+            if (moveTo(mc, player, target, 0.9D)) {
+                if (interactionMovementTimedOut(task, player))
+                    return failTask(player, task, "Navigation timed out before reaching the requested position");
+                return true;
+            }
+            resetInteractionMovement(task);
+            return distSq(player, target) <= 0.9D ? false
+                : failTask(player, task, "No navigable path to the requested position");
         }
         if (task.kind == TaskKind.FOLLOW) {
             EntityPlayer target = findPlayer(mc, task.targetPlayer);
-            if (target == null) return false;
-            return moveTo(
-                mc,
-                player,
-                new BlockPos(
-                    MathHelper.floor_double(target.posX),
-                    MathHelper.floor_double(target.posY),
-                    MathHelper.floor_double(target.posZ)),
-                2.35D);
+            if (target == null) return failTask(player, task, "The player to follow is not present");
+            BlockPos targetPosition = new BlockPos(
+                MathHelper.floor_double(target.posX),
+                MathHelper.floor_double(target.posY),
+                MathHelper.floor_double(target.posZ));
+            if (moveTo(mc, player, targetPosition, 2.35D)) {
+                if (interactionMovementTimedOut(task, player))
+                    return failTask(player, task, "Navigation timed out while following the player");
+                return true;
+            }
+            resetInteractionMovement(task);
+            return distSq(player, targetPosition) <= 2.35D ? false
+                : failTask(player, task, "No navigable path to the player being followed");
         }
         if (task.kind == TaskKind.BREAK) {
-            if (moveTo(mc, player, new BlockPos(task.x, task.y, task.z), 1.35D)) return true;
+            BlockPos target = new BlockPos(task.x, task.y, task.z);
+            if (moveToInteraction(mc, player, target, 1.35D)) {
+                if (interactionMovementTimedOut(task, player))
+                    return failTask(player, task, "Navigation timed out before reaching the block to break");
+                return true;
+            }
+            resetInteractionMovement(task);
+            if (!isAtInteractionPosition(mc.theWorld, player, target, 1.35D))
+                return failTask(player, task, "No navigable path to the block to break");
             return !breakBlock(mc, task.x, task.y, task.z);
         }
         if (task.kind == TaskKind.USE || task.kind == TaskKind.PLACE) {
-            if (moveTo(mc, player, new BlockPos(task.x, task.y, task.z), 1.6D)) return true;
-            useOrPlace(mc, player, task.x, task.y, task.z, task.side);
+            BlockPos target = new BlockPos(task.x, task.y, task.z);
+            if (moveToInteraction(mc, player, target, 1.6D)) {
+                if (interactionMovementTimedOut(task, player))
+                    return failTask(player, task, "Navigation timed out before reaching the target block");
+                return true;
+            }
+            resetInteractionMovement(task);
+            if (!isAtInteractionPosition(mc.theWorld, player, target, 1.6D))
+                return failTask(player, task, "No navigable path to the target block");
+            if (!useOrPlace(mc, player, task.x, task.y, task.z, task.side))
+                return failTask(player, task, "Minecraft rejected the block interaction");
+            TrackedAction action = trackedAction(task);
+            if (action != null) action.complete("Block interaction accepted by Minecraft");
             return false;
         }
         if (task.kind == TaskKind.CRAFT) {
-            return runCraft(player, task);
+            return runCraft(mc, player, task);
         }
         return false;
     }
 
-    private boolean runCraft(EntityClientPlayerMP player, ClientTask task) {
+    private boolean runCraft(Minecraft mc, EntityClientPlayerMP player, ClientTask task) {
         if (countByQuery(player, task.itemQuery) >= task.targetCount) {
             return false;
         }
-        if (!craftOneRecursive(player, task.itemQuery, new HashSet<String>(), 0)) {
-            task.missingCooldown--;
-            if (task.missingCooldown <= 0) {
-                task.missingCooldown = 80;
-                player.addChatComponentMessage(
-                    new ChatComponentText("[GTNH AI Bot] Missing ingredients for " + task.itemQuery));
-            }
+        if (recipeIndex.getState() == LiveRecipeIndex.State.FAILED)
+            return failCraft(player, task, "Recipe indexing failed: " + recipeIndex.getError());
+        if (!recipeIndex.isReadyForCrafting()) {
+            updateAction(task, "indexing_recipes", "Indexing loaded recipes: " + recipeIndex.size() + " found so far");
+            return true;
         }
+        if (task.craftPhase == CraftPhase.NEW || task.craftPhase == CraftPhase.PLANNING) {
+            return planCraft(player, task);
+        }
+        if (task.craftPhase == CraftPhase.SCANNING_STORAGE) return scanStorageForCraft(mc, player, task);
+        if (task.craftPhase == CraftPhase.RETRIEVING) return retrieveCraftResources(mc, player, task);
+        if (task.craftPhase == CraftPhase.EXECUTING) return executeCraftPlan(mc, player, task);
+        return failCraft(player, task, "Unknown crafting state");
+    }
+
+    private boolean planCraft(EntityClientPlayerMP player, ClientTask task) {
+        if (task.phaseWaitTicks > 0) {
+            task.phaseWaitTicks--;
+            return true;
+        }
+        if (task.itemQuery == null || task.itemQuery.indexOf(':') < 1)
+            return failCraft(player, task, "Crafting requires an exact registry item ID");
+        updateAction(task, "planning", "Resolving inventory, storage, and loaded recipe dependencies");
+        StackKey target = new StackKey(task.itemQuery, StackKey.WILDCARD_DAMAGE, "");
+        ResourceLedger resources = resourceLedger(player);
+        CraftPlanner planner = new CraftPlanner(recipeIndex.getCatalog(), 2000, 16, TimeUnit.MILLISECONDS.toNanos(20L));
+        CraftPlan plan = planner.plan(target, task.targetCount, resources);
+        if (!plan.isFeasible()) {
+            List<ChestKey> unknown = unknownNearbyChests(player);
+            if (!unknown.isEmpty() && !task.storageScanCompleted) {
+                task.storageScanQueue = new ArrayDeque<ChestKey>(unknown);
+                task.craftPhase = CraftPhase.SCANNING_STORAGE;
+                task.craftMissing = plan.getMissing() == null ? "unknown"
+                    : plan.getMissing()
+                        .canonical();
+                updateAction(
+                    task,
+                    "scanning_storage",
+                    craftPlanningContext(task) + "; opening nearby storage to find " + task.craftMissing);
+                return true;
+            }
+            return failCraft(
+                player,
+                task,
+                plan.getFailure() + (plan.getMissing() == null ? ""
+                    : ": " + plan.getMissing()
+                        .canonical()));
+        }
+        acceptCraftPlan(task, plan);
         return true;
     }
 
-    private boolean craftOneRecursive(EntityClientPlayerMP player, String query, Set<String> visiting, int depth) {
-        if (depth > 6) return false;
-        String key = query.toLowerCase();
-        if (visiting.contains(key)) return false;
-        visiting.add(key);
-        try {
-            List<RecipePlan> plans = findRecipePlans(query);
-            for (int i = 0; i < plans.size(); i++) {
-                if (tryCraft(player, plans.get(i), visiting, depth)) return true;
+    private void acceptCraftPlan(ClientTask task, CraftPlan plan) {
+        task.craftPlan = plan;
+        task.requiredChestItems = requiredChestItems(plan);
+        if (!task.requiredChestItems.isEmpty()) {
+            task.craftPhase = CraftPhase.RETRIEVING;
+            updateAction(task, "retrieving", "Retrieving planned ingredients from nearby storage");
+        } else {
+            task.craftPhase = CraftPhase.EXECUTING;
+            updateAction(
+                task,
+                "crafting",
+                "Executing " + plan.getSteps()
+                    .size() + " verified recipe steps");
+        }
+    }
+
+    private ResourceLedger resourceLedger(EntityClientPlayerMP player) {
+        Map<StackKey, Integer> inventory = new HashMap<StackKey, Integer>();
+        for (int i = 0; i < player.inventory.mainInventory.length; i++) {
+            ItemStack stack = player.inventory.mainInventory[i];
+            if (stack != null && stack.stackSize > 0) addStock(inventory, craftingKey(stack), stack.stackSize);
+        }
+        Map<StackKey, Integer> chests = new HashMap<StackKey, Integer>();
+        for (ChestSnapshot snapshot : chestCache.values()) {
+            if (!snapshot.trusted) continue;
+            for (Map.Entry<StackKey, Integer> entry : snapshot.exactItems.entrySet()) {
+                addStock(
+                    chests,
+                    entry.getKey(),
+                    entry.getValue()
+                        .intValue());
             }
+        }
+        return new ResourceLedger(inventory, chests);
+    }
+
+    private void addStock(Map<StackKey, Integer> stock, StackKey key, int count) {
+        Integer current = stock.get(key);
+        stock.put(key, Integer.valueOf((current == null ? 0 : current.intValue()) + count));
+    }
+
+    private StackKey craftingKey(ItemStack stack) {
+        String nbt = stack.hasTagCompound() ? stack.getTagCompound()
+            .toString() : "";
+        return new StackKey(stackKey(stack), stack.getItemDamage(), nbt);
+    }
+
+    private List<ChestKey> unknownNearbyChests(final EntityClientPlayerMP player) {
+        List<ChestKey> unknown = new ArrayList<ChestKey>();
+        for (Map.Entry<ChestKey, ChestSnapshot> entry : chestCache.entrySet()) {
+            if (!entry.getValue().trusted) unknown.add(entry.getKey());
+        }
+        unknown.sort(new Comparator<ChestKey>() {
+
+            @Override
+            public int compare(ChestKey left, ChestKey right) {
+                return Double.compare(
+                    distSq(player, new BlockPos(left.x, left.y, left.z)),
+                    distSq(player, new BlockPos(right.x, right.y, right.z)));
+            }
+        });
+        return unknown;
+    }
+
+    private Map<StackKey, Integer> requiredChestItems(CraftPlan plan) {
+        Map<StackKey, Integer> required = new HashMap<StackKey, Integer>();
+        for (ResourceLedger.Withdrawal withdrawal : plan.getWithdrawals()) {
+            if (withdrawal.getSource() == ResourceLedger.Source.CHEST)
+                addStock(required, withdrawal.getKey(), withdrawal.getCount());
+        }
+        return required;
+    }
+
+    private boolean scanStorageForCraft(Minecraft mc, EntityClientPlayerMP player, ClientTask task) {
+        if (task.activeChest == null) {
+            if (player.openContainer != player.inventoryContainer) player.closeScreen();
+            task.activeChest = task.storageScanQueue.poll();
+            task.phaseWaitTicks = 0;
+            resetInteractionMovement(task);
+            if (task.activeChest == null) {
+                task.storageScanCompleted = true;
+                task.craftPhase = CraftPhase.PLANNING;
+                updateAction(task, "planning", "Storage scan completed; rebuilding the dependency plan");
+                return true;
+            }
+        }
+        ChestKey chest = task.activeChest;
+        updateAction(
+            task,
+            "scanning_storage",
+            craftPlanningContext(task) + "; missing "
+                + task.craftMissing
+                + "; inspecting chest at "
+                + chest.x
+                + ","
+                + chest.y
+                + ","
+                + chest.z);
+        if (moveToInteraction(mc, player, new BlockPos(chest.x, chest.y, chest.z), 2.5D)) {
+            if (interactionMovementTimedOut(task, player)) {
+                updateAction(
+                    task,
+                    "scanning_storage",
+                    "Skipping chest after navigation timed out at " + chest.x + "," + chest.y + "," + chest.z);
+                task.activeChest = null;
+                resetInteractionMovement(task);
+                currentPath.clear();
+            }
+            return true;
+        }
+        resetInteractionMovement(task);
+        if (!isAtInteractionPosition(mc.theWorld, player, new BlockPos(chest.x, chest.y, chest.z), 2.5D)) {
+            updateAction(
+                task,
+                "scanning_storage",
+                "Skipping unreachable chest at " + chest.x + "," + chest.y + "," + chest.z);
+            task.activeChest = null;
+            return true;
+        }
+        IInventory inventory = chestInventory(mc, chest);
+        if (inventory == null) {
+            task.activeChest = null;
+            return true;
+        }
+        if (!hasOpenStorageContainer(player)) {
+            if (task.phaseWaitTicks % 20 == 0) useOrPlace(mc, player, chest.x, chest.y, chest.z, 1);
+            task.phaseWaitTicks++;
+            if (task.phaseWaitTicks > 80) task.activeChest = null;
+            return true;
+        }
+        captureOpenStorage(mc, player, chest);
+        player.closeScreen();
+        task.activeChest = null;
+        task.phaseWaitTicks = 0;
+        StackKey target = new StackKey(task.itemQuery, StackKey.WILDCARD_DAMAGE, "");
+        CraftPlan updated = new CraftPlanner(recipeIndex.getCatalog(), 2000, 16, TimeUnit.MILLISECONDS.toNanos(20L))
+            .plan(target, task.targetCount, resourceLedger(player));
+        if (updated.isFeasible()) acceptCraftPlan(task, updated);
+        return true;
+    }
+
+    private boolean retrieveCraftResources(Minecraft mc, EntityClientPlayerMP player, ClientTask task) {
+        if (task.pendingRetrieval != null) {
+            if (task.phaseWaitTicks-- > 0) return true;
+            StackKey retrieved = task.pendingRetrieval;
+            int moved = countCraftingKey(player, retrieved) - task.retrievalCountBefore;
+            if (moved <= 0) return failCraft(player, task, "Storage transfer was not confirmed; inventory may be full");
+            int remaining = task.requiredChestItems.get(retrieved)
+                .intValue() - moved;
+            if (remaining <= 0) task.requiredChestItems.remove(retrieved);
+            else task.requiredChestItems.put(retrieved, Integer.valueOf(remaining));
+            captureOpenStorage(mc, player, task.activeChest);
+            task.pendingRetrieval = null;
+            task.phaseWaitTicks = 0;
+            return true;
+        }
+        StackKey needed = firstRequiredItem(task.requiredChestItems);
+        if (needed == null) {
+            if (player.openContainer != player.inventoryContainer) player.closeScreen();
+            task.craftPlan = null;
+            task.craftPhase = CraftPhase.PLANNING;
+            task.phaseWaitTicks = 5;
+            updateAction(task, "verifying_retrieval", "Verifying retrieved ingredients with the server");
+            return true;
+        }
+        if (task.activeChest == null) {
+            if (player.openContainer != player.inventoryContainer) player.closeScreen();
+            task.activeChest = findTrustedChestWith(needed);
+            task.phaseWaitTicks = 0;
+            resetInteractionMovement(task);
+            if (task.activeChest == null)
+                return failCraft(player, task, "Planned chest item is no longer available: " + needed.canonical());
+        }
+        ChestKey chest = task.activeChest;
+        updateAction(
+            task,
+            "retrieving",
+            "Retrieving " + needed.canonical() + " from " + chest.x + "," + chest.y + "," + chest.z);
+        if (moveToInteraction(mc, player, new BlockPos(chest.x, chest.y, chest.z), 2.5D)) {
+            if (interactionMovementTimedOut(task, player)) return failCraft(
+                player,
+                task,
+                "Navigation timed out while approaching required storage at " + chest.x
+                    + ","
+                    + chest.y
+                    + ","
+                    + chest.z);
+            return true;
+        }
+        resetInteractionMovement(task);
+        if (!isAtInteractionPosition(mc.theWorld, player, new BlockPos(chest.x, chest.y, chest.z), 2.5D))
+            return failCraft(
+                player,
+                task,
+                "No navigable path to required storage at " + chest.x + "," + chest.y + "," + chest.z);
+        IInventory inventory = chestInventory(mc, chest);
+        if (inventory == null)
+            return failCraft(player, task, "Storage disappeared at " + chest.x + "," + chest.y + "," + chest.z);
+        if (!hasOpenStorageContainer(player)) {
+            if (task.phaseWaitTicks % 20 == 0) useOrPlace(mc, player, chest.x, chest.y, chest.z, 1);
+            task.phaseWaitTicks++;
+            if (task.phaseWaitTicks > 80)
+                return failCraft(player, task, "Could not open storage at " + chest.x + "," + chest.y + "," + chest.z);
+            return true;
+        }
+        task.retrievalCountBefore = countCraftingKey(player, needed);
+        if (!shiftClickMatchingChestStack(mc, player, needed)) {
+            captureOpenStorage(mc, player, chest);
+            task.activeChest = null;
+            return true;
+        }
+        task.pendingRetrieval = needed;
+        task.phaseWaitTicks = 4;
+        return true;
+    }
+
+    private IInventory chestInventory(Minecraft mc, ChestKey key) {
+        if (mc == null || mc.theWorld == null || mc.theWorld.provider.dimensionId != key.dim) return null;
+        TileEntity tile = mc.theWorld.getTileEntity(key.x, key.y, key.z);
+        return tile instanceof IInventory ? (IInventory) tile : null;
+    }
+
+    private boolean hasOpenStorageContainer(EntityClientPlayerMP player) {
+        if (player == null || player.openContainer == null || player.openContainer == player.inventoryContainer)
             return false;
-        } finally {
-            visiting.remove(key);
-        }
+        return !(player.openContainer instanceof ContainerWorkbench);
     }
 
-    private boolean tryCraft(EntityClientPlayerMP player, RecipePlan plan, Set<String> visiting, int depth) {
-        for (int i = 0; i < plan.ingredients.size(); i++) {
-            Ingredient need = plan.ingredients.get(i);
-            while (countTemplate(player, need.template) < need.count) {
-                String sub = stackKey(need.template);
-                if (!craftOneRecursive(player, sub, visiting, depth + 1)) return false;
-            }
-        }
-        for (int i = 0; i < plan.ingredients.size(); i++) {
-            Ingredient need = plan.ingredients.get(i);
-            for (int j = 0; j < need.count; j++) {
-                if (!removeOne(player, need.template)) return false;
-            }
-        }
-        ItemStack out = plan.output.copy();
-        if (!player.inventory.addItemStackToInventory(out)) {
-            player.dropPlayerItemWithRandomChoice(out, false);
-        }
-        return true;
+    private void captureOpenStorage(Minecraft mc, EntityClientPlayerMP player, ChestKey key) {
+        chestCache.put(key, snapshotOpenStorage(player, mc.theWorld.getTotalWorldTime()));
+        chestCacheDirty = true;
+        recomputeCachedTotals();
     }
 
-    private List<RecipePlan> findRecipePlans(String query) {
-        List<RecipePlan> out = new ArrayList<RecipePlan>();
-        List recipes = CraftingManager.getInstance()
-            .getRecipeList();
-        for (int i = 0; i < recipes.size(); i++) {
-            Object o = recipes.get(i);
-            if (!(o instanceof IRecipe)) continue;
-            IRecipe r = (IRecipe) o;
-            ItemStack result = r.getRecipeOutput();
-            if (result == null || !matchesQuery(result, query)) continue;
-            RecipePlan plan = planFromRecipe(r, result);
-            if (plan != null && !plan.ingredients.isEmpty()) out.add(plan);
+    private ChestSnapshot snapshotOpenStorage(EntityClientPlayerMP player, long when) {
+        Map<String, Integer> counts = new HashMap<String, Integer>();
+        Map<StackKey, Integer> exactCounts = new HashMap<StackKey, Integer>();
+        List slots = player.openContainer.inventorySlots;
+        for (int i = 0; i < slots.size(); i++) {
+            Object object = slots.get(i);
+            if (!(object instanceof Slot)) continue;
+            Slot slot = (Slot) object;
+            if (slot.inventory == player.inventory) continue;
+            ItemStack stack = slot.getStack();
+            if (stack == null || stack.stackSize <= 0) continue;
+            String itemKey = stackKey(stack) + ":" + stack.getItemDamage();
+            Integer current = counts.get(itemKey);
+            counts.put(itemKey, Integer.valueOf((current == null ? 0 : current.intValue()) + stack.stackSize));
+            addStock(exactCounts, craftingKey(stack), stack.stackSize);
         }
-        return out;
+        return new ChestSnapshot(counts, exactCounts, when, true);
     }
 
-    private RecipePlan planFromRecipe(IRecipe recipe, ItemStack out) {
-        List<Ingredient> ingredients = new ArrayList<Ingredient>();
-        if (recipe instanceof ShapedRecipes) {
-            ItemStack[] items = ((ShapedRecipes) recipe).recipeItems;
-            for (int i = 0; i < items.length; i++) addIngredient(ingredients, items[i]);
-            return new RecipePlan(out, ingredients);
-        }
-        if (recipe instanceof ShapelessRecipes) {
-            List items = ((ShapelessRecipes) recipe).recipeItems;
-            for (int i = 0; i < items.size(); i++) addIngredient(ingredients, items.get(i));
-            return new RecipePlan(out, ingredients);
-        }
-        if (recipe instanceof ShapedOreRecipe) {
-            Object[] items = ((ShapedOreRecipe) recipe).getInput();
-            for (int i = 0; i < items.length; i++) addIngredient(ingredients, items[i]);
-            return new RecipePlan(out, ingredients);
-        }
-        if (recipe instanceof ShapelessOreRecipe) {
-            List items = ((ShapelessOreRecipe) recipe).getInput();
-            for (int i = 0; i < items.size(); i++) addIngredient(ingredients, items.get(i));
-            return new RecipePlan(out, ingredients);
+    private StackKey firstRequiredItem(Map<StackKey, Integer> required) {
+        for (Map.Entry<StackKey, Integer> entry : required.entrySet()) {
+            if (entry.getValue()
+                .intValue() > 0) return entry.getKey();
         }
         return null;
     }
 
-    private void addIngredient(List<Ingredient> list, Object obj) {
-        ItemStack stack = null;
-        if (obj instanceof ItemStack) stack = ((ItemStack) obj).copy();
-        if (obj instanceof Item) stack = new ItemStack((Item) obj);
-        if (obj instanceof Block) stack = new ItemStack((Block) obj);
-        if (obj instanceof List) {
-            List items = (List) obj;
-            if (!items.isEmpty() && items.get(0) instanceof ItemStack) stack = ((ItemStack) items.get(0)).copy();
+    private ChestKey findTrustedChestWith(StackKey needed) {
+        for (Map.Entry<ChestKey, ChestSnapshot> entry : chestCache.entrySet()) {
+            if (!entry.getValue().trusted) continue;
+            for (Map.Entry<StackKey, Integer> item : entry.getValue().exactItems.entrySet()) {
+                if (needed.matches(item.getKey()) && item.getValue()
+                    .intValue() > 0) return entry.getKey();
+            }
         }
-        if (stack != null) list.add(new Ingredient(stack, 1));
+        return null;
+    }
+
+    private boolean shiftClickMatchingChestStack(Minecraft mc, EntityClientPlayerMP player, StackKey needed) {
+        List slots = player.openContainer.inventorySlots;
+        for (int i = 0; i < slots.size(); i++) {
+            Object object = slots.get(i);
+            if (!(object instanceof Slot)) continue;
+            Slot slot = (Slot) object;
+            ItemStack stack = slot.getStack();
+            if (slot.inventory == player.inventory || stack == null || !needed.matches(craftingKey(stack))) continue;
+            mc.playerController.windowClick(player.openContainer.windowId, slot.slotNumber, 0, 1, player);
+            return true;
+        }
+        return false;
+    }
+
+    private boolean executeCraftPlan(Minecraft mc, EntityClientPlayerMP player, ClientTask task) {
+        if (task.craftPlan == null) return failCraft(player, task, "Craft plan was lost");
+        if (task.craftStepIndex >= task.craftPlan.getSteps()
+            .size()) {
+            clearOpenCraftingGrid(mc, player);
+            if (player.openContainer != player.inventoryContainer) player.closeScreen();
+            return countByQuery(player, task.itemQuery) >= task.targetCount ? false
+                : failCraft(player, task, "Recipe steps finished but the requested output was not confirmed");
+        }
+        CraftPlan.Step step = task.craftPlan.getSteps()
+            .get(task.craftStepIndex);
+        RecipeDefinition recipe = step.getRecipe();
+        if (recipe.getStation() != dev.nottambok.gtnhaibot.client.crafting.RecipeStation.PLAYER_2X2
+            && recipe.getStation() != dev.nottambok.gtnhaibot.client.crafting.RecipeStation.CRAFTING_TABLE)
+            return failCraft(player, task, "No executor for recipe station " + recipe.getStationId());
+        if (!prepareCraftingContainer(mc, player, task, recipe)) {
+            TrackedAction action = trackedAction(task);
+            return action == null || !action.isTerminal();
+        }
+        if (task.executionStage == CraftExecutionStage.CLEAR_GRID) {
+            if (shiftClickFirstGridStack(mc, player)) return true;
+            task.craftSlotIndex = 0;
+            task.executionStage = CraftExecutionStage.PLACE_INGREDIENTS;
+        }
+        if (task.executionStage == CraftExecutionStage.PLACE_INGREDIENTS) {
+            List<IngredientRequirement> slots = recipe.getSlots();
+            while (task.craftSlotIndex < slots.size() && slots.get(task.craftSlotIndex) == null) task.craftSlotIndex++;
+            if (task.craftSlotIndex < slots.size()) {
+                IngredientRequirement ingredient = slots.get(task.craftSlotIndex);
+                int targetSlot = targetGridSlot(
+                    recipe,
+                    task.craftSlotIndex,
+                    player.openContainer instanceof ContainerPlayer);
+                if (!placeIngredient(mc, player, ingredient, targetSlot)) return failCraft(
+                    player,
+                    task,
+                    "Planned ingredient was not present in inventory for " + recipe.getId());
+                task.craftSlotIndex++;
+                return true;
+            }
+            task.phaseWaitTicks = 0;
+            task.executionStage = CraftExecutionStage.WAIT_OUTPUT;
+        }
+        if (task.executionStage == CraftExecutionStage.WAIT_OUTPUT) {
+            ItemStack output = outputSlot(player).getStack();
+            if (output == null || !recipe.getOutput()
+                .matches(craftingKey(output))) {
+                task.phaseWaitTicks++;
+                if (task.phaseWaitTicks > 20) return rejectRecipeAndReplan(mc, player, task, recipe);
+                return true;
+            }
+            task.outputCountBefore = countCraftingKey(player, recipe.getOutput());
+            mc.playerController.windowClick(player.openContainer.windowId, outputSlot(player).slotNumber, 0, 1, player);
+            task.phaseWaitTicks = 4;
+            task.executionStage = CraftExecutionStage.VERIFY_OUTPUT;
+            return true;
+        }
+        if (task.executionStage == CraftExecutionStage.VERIFY_OUTPUT) {
+            if (task.phaseWaitTicks-- > 0) return true;
+            if (countCraftingKey(player, recipe.getOutput()) <= task.outputCountBefore)
+                return failCraft(player, task, "Server did not confirm crafted output for " + recipe.getId());
+            task.craftRepeatIndex++;
+            if (task.craftRepeatIndex >= step.getCrafts()) {
+                task.craftStepIndex++;
+                task.craftRepeatIndex = 0;
+            }
+            task.executionStage = CraftExecutionStage.PREPARE_STATION;
+            task.craftSlotIndex = 0;
+            updateAction(
+                task,
+                "crafting",
+                "Completed recipe step " + task.craftStepIndex
+                    + " of "
+                    + task.craftPlan.getSteps()
+                        .size());
+        }
+        return true;
+    }
+
+    private boolean rejectRecipeAndReplan(Minecraft mc, EntityClientPlayerMP player, ClientTask task,
+        RecipeDefinition recipe) {
+        task.rejectedRecipeCount++;
+        if (task.rejectedRecipeCount > 8) return failCraft(
+            player,
+            task,
+            "Too many loaded crafting recipes were rejected by the server; last recipe " + recipe.getId()
+                + " from "
+                + recipe.getProvider());
+        recipeIndex.getCatalog()
+            .disable(recipe.getId());
+        task.lastRejectedRecipeId = recipe.getId();
+        clearOpenCraftingGrid(mc, player);
+        if (player.openContainer != player.inventoryContainer) player.closeScreen();
+        task.craftPlan = null;
+        task.craftPhase = CraftPhase.PLANNING;
+        task.phaseWaitTicks = 4;
+        task.craftStepIndex = 0;
+        task.craftRepeatIndex = 0;
+        task.craftSlotIndex = 0;
+        task.executionStage = CraftExecutionStage.PREPARE_STATION;
+        updateAction(
+            task,
+            "replanning",
+            "Server rejected " + recipe.getId() + " from " + recipe.getProvider() + "; trying the next loaded recipe");
+        return true;
+    }
+
+    private String craftPlanningContext(ClientTask task) {
+        return task.lastRejectedRecipeId == null ? "Planning recipe" : "Rejected " + task.lastRejectedRecipeId;
+    }
+
+    private boolean prepareCraftingContainer(Minecraft mc, EntityClientPlayerMP player, ClientTask task,
+        RecipeDefinition recipe) {
+        if (recipe.getStation() == dev.nottambok.gtnhaibot.client.crafting.RecipeStation.PLAYER_2X2) {
+            if (player.openContainer != player.inventoryContainer) player.closeScreen();
+            if (!(player.openContainer instanceof ContainerPlayer)) return false;
+            if (task.executionStage == CraftExecutionStage.PREPARE_STATION)
+                task.executionStage = CraftExecutionStage.CLEAR_GRID;
+            return true;
+        }
+        if (player.openContainer instanceof ContainerWorkbench) {
+            if (task.executionStage == CraftExecutionStage.PREPARE_STATION)
+                task.executionStage = CraftExecutionStage.CLEAR_GRID;
+            return true;
+        }
+        if (task.craftingTable == null) {
+            task.craftingTable = nearestBlock(player, "minecraft:crafting_table");
+            resetInteractionMovement(task);
+            if (task.craftingTable == null) {
+                failCraft(player, task, "No nearby crafting table is available for " + recipe.getId());
+                return false;
+            }
+        }
+        updateAction(
+            task,
+            "opening_crafting_table",
+            "Opening crafting table at " + task.craftingTable.x
+                + ","
+                + task.craftingTable.y
+                + ","
+                + task.craftingTable.z);
+        if (moveToInteraction(mc, player, task.craftingTable, 2.5D)) {
+            if (interactionMovementTimedOut(task, player))
+                failCraft(player, task, "Navigation timed out while approaching the nearby crafting table");
+            return false;
+        }
+        resetInteractionMovement(task);
+        if (!isAtInteractionPosition(mc.theWorld, player, task.craftingTable, 2.5D)) {
+            failCraft(player, task, "No navigable path to nearby crafting table");
+            return false;
+        }
+        if (task.phaseWaitTicks % 20 == 0)
+            useOrPlace(mc, player, task.craftingTable.x, task.craftingTable.y, task.craftingTable.z, 1);
+        task.phaseWaitTicks++;
+        if (task.phaseWaitTicks > 80) {
+            failCraft(player, task, "Could not open nearby crafting table");
+            return false;
+        }
+        return false;
+    }
+
+    private BlockPos nearestBlock(EntityClientPlayerMP player, String registryId) {
+        BlockPos closest = null;
+        double closestDistance = Double.MAX_VALUE;
+        Map<String, List<BlockPos>> blocks = mergedBlockIndex();
+        for (Map.Entry<String, List<BlockPos>> entry : blocks.entrySet()) {
+            if (!entry.getKey()
+                .startsWith(registryId)) continue;
+            for (int i = 0; i < entry.getValue()
+                .size(); i++) {
+                BlockPos position = entry.getValue()
+                    .get(i);
+                double distance = distSq(player, position);
+                if (distance < closestDistance) {
+                    closest = position;
+                    closestDistance = distance;
+                }
+            }
+        }
+        return closest;
+    }
+
+    private boolean shiftClickFirstGridStack(Minecraft mc, EntityClientPlayerMP player) {
+        int size = player.openContainer instanceof ContainerPlayer ? 4 : 9;
+        for (int i = 1; i <= size; i++) {
+            Slot slot = (Slot) player.openContainer.inventorySlots.get(i);
+            if (slot.getStack() == null) continue;
+            mc.playerController.windowClick(player.openContainer.windowId, slot.slotNumber, 0, 1, player);
+            return true;
+        }
+        return false;
+    }
+
+    private void clearOpenCraftingGrid(Minecraft mc, EntityClientPlayerMP player) {
+        if (player == null || player.openContainer == null) return;
+        if (!(player.openContainer instanceof ContainerPlayer) && !(player.openContainer instanceof ContainerWorkbench))
+            return;
+        int size = player.openContainer instanceof ContainerPlayer ? 4 : 9;
+        for (int i = 1; i <= size; i++) {
+            Slot slot = (Slot) player.openContainer.inventorySlots.get(i);
+            if (slot.getStack() != null)
+                mc.playerController.windowClick(player.openContainer.windowId, slot.slotNumber, 0, 1, player);
+        }
+    }
+
+    private int targetGridSlot(RecipeDefinition recipe, int recipeSlot, boolean playerGrid) {
+        int gridWidth = playerGrid ? 2 : 3;
+        if (!recipe.isShaped()) return 1 + recipeSlot;
+        int row = recipeSlot / recipe.getWidth();
+        int column = recipeSlot % recipe.getWidth();
+        return 1 + row * gridWidth + column;
+    }
+
+    private boolean placeIngredient(Minecraft mc, EntityClientPlayerMP player, IngredientRequirement ingredient,
+        int targetSlotNumber) {
+        Slot source = findPlayerInventorySlot(player, ingredient);
+        if (source == null) return false;
+        Slot target = (Slot) player.openContainer.inventorySlots.get(targetSlotNumber);
+        mc.playerController.windowClick(player.openContainer.windowId, source.slotNumber, 0, 0, player);
+        for (int i = 0; i < ingredient.getCount(); i++)
+            mc.playerController.windowClick(player.openContainer.windowId, target.slotNumber, 1, 0, player);
+        mc.playerController.windowClick(player.openContainer.windowId, source.slotNumber, 0, 0, player);
+        return true;
+    }
+
+    private Slot findPlayerInventorySlot(EntityClientPlayerMP player, IngredientRequirement ingredient) {
+        List slots = player.openContainer.inventorySlots;
+        for (int i = 0; i < slots.size(); i++) {
+            Object object = slots.get(i);
+            if (!(object instanceof Slot)) continue;
+            Slot slot = (Slot) object;
+            ItemStack stack = slot.getStack();
+            if (slot.inventory != player.inventory || stack == null || stack.stackSize < ingredient.getCount())
+                continue;
+            StackKey actual = craftingKey(stack);
+            for (int j = 0; j < ingredient.getAlternatives()
+                .size(); j++) {
+                if (ingredient.getAlternatives()
+                    .get(j)
+                    .matches(actual)) return slot;
+            }
+        }
+        return null;
+    }
+
+    private Slot outputSlot(EntityClientPlayerMP player) {
+        return (Slot) player.openContainer.inventorySlots.get(0);
+    }
+
+    private int countCraftingKey(EntityClientPlayerMP player, StackKey key) {
+        int total = 0;
+        for (int i = 0; i < player.inventory.mainInventory.length; i++) {
+            ItemStack stack = player.inventory.mainInventory[i];
+            if (stack != null && key.matches(craftingKey(stack))) total += stack.stackSize;
+        }
+        return total;
+    }
+
+    private boolean failCraft(EntityClientPlayerMP player, ClientTask task, String message) {
+        TrackedAction action = trackedAction(task);
+        if (action != null) action.fail(message);
+        player.addChatComponentMessage(new ChatComponentText("[GTNH AI Bot] Craft failed: " + message));
+        return false;
+    }
+
+    private boolean failTask(EntityClientPlayerMP player, ClientTask task, String message) {
+        TrackedAction action = trackedAction(task);
+        if (action != null) action.fail(message);
+        player.addChatComponentMessage(new ChatComponentText("[GTNH AI Bot] Action failed: " + message));
+        return false;
+    }
+
+    private void updateAction(ClientTask task, String phase, String message) {
+        TrackedAction action = trackedAction(task);
+        if (action != null) action.running(phase, message);
     }
 
     private boolean matchesQuery(ItemStack stack, String queryRaw) {
         String query = norm(queryRaw);
+        if (queryRaw != null && queryRaw.indexOf(':') >= 0) return norm(stackKey(stack)).equals(query);
         return norm(stack.getDisplayName()).contains(query) || norm(stackKey(stack)).contains(query);
     }
 
@@ -955,33 +1623,6 @@ public class ClientBotController {
             if (s != null && matchesQuery(s, query)) total += s.stackSize;
         }
         return total;
-    }
-
-    private int countTemplate(EntityClientPlayerMP player, ItemStack template) {
-        int total = 0;
-        for (int i = 0; i < player.inventory.mainInventory.length; i++) {
-            ItemStack s = player.inventory.mainInventory[i];
-            if (s != null && sameItem(s, template)) total += s.stackSize;
-        }
-        return total;
-    }
-
-    private boolean removeOne(EntityClientPlayerMP player, ItemStack template) {
-        for (int i = 0; i < player.inventory.mainInventory.length; i++) {
-            ItemStack s = player.inventory.mainInventory[i];
-            if (s != null && sameItem(s, template)) {
-                s.stackSize--;
-                if (s.stackSize <= 0) player.inventory.mainInventory[i] = null;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean sameItem(ItemStack a, ItemStack b) {
-        if (a.getItem() != b.getItem()) return false;
-        int dmg = b.getItemDamage();
-        return dmg == OreDictionary.WILDCARD_VALUE || a.getItemDamage() == dmg;
     }
 
     private void loadGoalsIfNeeded() {
@@ -1372,8 +2013,14 @@ public class ClientBotController {
                 || Math.abs(chunkZ - playerChunkZ) > CHEST_SCAN_RADIUS_CHUNKS) {
                 continue;
             }
-            ChestKey key = new ChestKey(dim, te.xCoord, te.yCoord, te.zCoord);
-            ChestSnapshot snapshot = snapshotInventory((IInventory) te, world.getTotalWorldTime());
+            ChestKey key = canonicalChestKey(world, te, dim);
+            if (next.containsKey(key)) continue;
+            IInventory inventory = (IInventory) te;
+            boolean trusted = isOpenInventory(mc.thePlayer, inventory);
+            ChestSnapshot previous = chestCache.get(key);
+            ChestSnapshot snapshot = trusted ? snapshotOpenStorage(mc.thePlayer, world.getTotalWorldTime())
+                : previous != null && previous.trusted ? previous
+                    : snapshotInventory(inventory, world.getTotalWorldTime(), false);
             next.put(key, snapshot);
         }
         if (!next.equals(chestCache)) {
@@ -1393,7 +2040,41 @@ public class ClientBotController {
         return name.contains("chest");
     }
 
-    private ChestSnapshot snapshotInventory(IInventory inv, long when) {
+    private ChestKey canonicalChestKey(World world, TileEntity tile, int dimension) {
+        int x = tile.xCoord;
+        int z = tile.zCoord;
+        if (tile instanceof TileEntityChest) {
+            int[][] neighbours = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+            for (int[] offset : neighbours) {
+                TileEntity neighbour = world
+                    .getTileEntity(tile.xCoord + offset[0], tile.yCoord, tile.zCoord + offset[1]);
+                if (neighbour instanceof TileEntityChest
+                    && world.getBlock(neighbour.xCoord, neighbour.yCoord, neighbour.zCoord)
+                        == world.getBlock(tile.xCoord, tile.yCoord, tile.zCoord)
+                    && (neighbour.xCoord < x || neighbour.xCoord == x && neighbour.zCoord < z)) {
+                    x = neighbour.xCoord;
+                    z = neighbour.zCoord;
+                }
+            }
+        }
+        return new ChestKey(dimension, x, tile.yCoord, z);
+    }
+
+    private boolean isOpenInventory(EntityClientPlayerMP player, IInventory inventory) {
+        if (player == null || player.openContainer == null) return false;
+        List slots = player.openContainer.inventorySlots;
+        for (int i = 0; i < slots.size(); i++) {
+            Object slot = slots.get(i);
+            if (slot instanceof Slot) {
+                IInventory open = ((Slot) slot).inventory;
+                if (open == inventory || open instanceof InventoryLargeChest
+                    && ((InventoryLargeChest) open).isPartOfLargeChest(inventory)) return true;
+            }
+        }
+        return false;
+    }
+
+    private ChestSnapshot snapshotInventory(IInventory inv, long when, boolean trusted) {
         Map<String, Integer> counts = new HashMap<String, Integer>();
         int size = inv.getSizeInventory();
         for (int i = 0; i < size; i++) {
@@ -1403,7 +2084,7 @@ public class ClientBotController {
             Integer seen = counts.get(key);
             counts.put(key, Integer.valueOf((seen == null ? 0 : seen.intValue()) + s.stackSize));
         }
-        return new ChestSnapshot(counts, when);
+        return new ChestSnapshot(counts, when, trusted);
     }
 
     private synchronized void recomputeCachedTotals() {
@@ -1444,7 +2125,7 @@ public class ClientBotController {
                 ChestKey key = new ChestKey(dim, x, y, z);
                 ChestSnapshot snap = chestCache.get(key);
                 if (snap == null) {
-                    snap = new ChestSnapshot(new HashMap<String, Integer>(), 0L);
+                    snap = new ChestSnapshot(new HashMap<String, Integer>(), 0L, false);
                     chestCache.put(key, snap);
                 }
                 Integer seen = snap.items.get(itemKey);
@@ -1600,13 +2281,13 @@ public class ClientBotController {
         return after == null || after.isAir(mc.theWorld, x, y, z);
     }
 
-    private void useOrPlace(Minecraft mc, EntityClientPlayerMP player, int x, int y, int z, int side) {
+    private boolean useOrPlace(Minecraft mc, EntityClientPlayerMP player, int x, int y, int z, int side) {
         if (mc.playerController == null) {
-            return;
+            return false;
         }
         Block beforeTarget = mc.theWorld.getBlock(x, y, z);
         int s = clampSide(side);
-        mc.playerController.onPlayerRightClick(
+        boolean accepted = mc.playerController.onPlayerRightClick(
             player,
             mc.theWorld,
             player.getCurrentEquippedItem(),
@@ -1623,14 +2304,12 @@ public class ClientBotController {
         if (beforeTarget == afterTarget && s != 1) {
             markChunkUnexpected(mc, x, z);
         }
+        return accepted;
     }
 
     private boolean moveTo(Minecraft mc, EntityClientPlayerMP p, BlockPos goal, double arriveSq) {
         if (distSq(p, goal) <= arriveSq) return false;
-        BlockPos start = new BlockPos(
-            MathHelper.floor_double(p.posX),
-            MathHelper.floor_double(p.posY),
-            MathHelper.floor_double(p.posZ));
+        BlockPos start = navigationPosition(mc.theWorld, p);
         pathRecalcCounter--;
         boolean changed = lastGoal == null || !lastGoal.equals(goal);
         if (currentPath.isEmpty() || pathRecalcCounter <= 0 || changed) {
@@ -1640,7 +2319,7 @@ public class ClientBotController {
         }
         BlockPos next = currentPath.peek();
         if (next == null) return false;
-        if (distSq(p, next) < 0.35D) {
+        if (isAtPathNode(p, next)) {
             currentPath.poll();
             return true;
         }
@@ -1654,7 +2333,93 @@ public class ClientBotController {
             p.motionZ = (dz / d) * 0.19D;
             p.rotationYaw = (float) (Math.atan2(dz, dx) * 180.0D / Math.PI) - 90.0F;
         }
+        if (next.y > start.y) p.motionY = 0.42D;
         return true;
+    }
+
+    private boolean moveToInteraction(Minecraft mc, EntityClientPlayerMP player, BlockPos target, double arriveSq) {
+        BlockPos start = navigationPosition(mc.theWorld, player);
+        if (isAtInteractionPosition(player, start, target, arriveSq)) return false;
+        pathRecalcCounter--;
+        boolean changed = lastGoal == null || !lastGoal.equals(target);
+        if (currentPath.isEmpty() || pathRecalcCounter <= 0 || changed) {
+            currentPath = AStarPathfinder.findPathToInteraction(mc.theWorld, start, target, MAX_PATH_NODES);
+            pathRecalcCounter = PATH_RECALC_TICKS;
+            lastGoal = target;
+        }
+        BlockPos next = currentPath.peek();
+        if (next == null) return false;
+        if (isAtPathNode(player, next)) {
+            currentPath.poll();
+            return true;
+        }
+        double dx = next.x + 0.5D - player.posX;
+        double dz = next.z + 0.5D - player.posZ;
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        if (horizontal > 0.0001D) {
+            player.motionX = (dx / horizontal) * 0.19D;
+            player.motionZ = (dz / horizontal) * 0.19D;
+            player.rotationYaw = (float) (Math.atan2(dz, dx) * 180.0D / Math.PI) - 90.0F;
+        }
+        if (next.y > start.y) player.motionY = 0.42D;
+        return true;
+    }
+
+    private BlockPos navigationPosition(World world, EntityClientPlayerMP player) {
+        BlockPos raw = new BlockPos(
+            MathHelper.floor_double(player.posX),
+            MathHelper.floor_double(player.posY),
+            MathHelper.floor_double(player.posZ));
+        BlockPos normalized = AStarPathfinder.normalizeStandPosition(world, raw);
+        return normalized == null ? raw : normalized;
+    }
+
+    private boolean isAtPathNode(EntityClientPlayerMP player, BlockPos node) {
+        double dx = player.posX - (node.x + 0.5D);
+        double dz = player.posZ - (node.z + 0.5D);
+        return dx * dx + dz * dz < 0.35D && Math.abs(player.posY - node.y) <= 1.25D;
+    }
+
+    private boolean isAtInteractionPosition(World world, EntityClientPlayerMP player, BlockPos target,
+        double arriveSq) {
+        BlockPos position = navigationPosition(world, player);
+        return isAtInteractionPosition(player, position, target, arriveSq);
+    }
+
+    private boolean interactionMovementTimedOut(ClientTask task, EntityClientPlayerMP player) {
+        task.interactionMoveTicks++;
+        if (Double.isNaN(task.lastInteractionX)) task.interactionStallTicks = 0;
+        else {
+            double dx = player.posX - task.lastInteractionX;
+            double dy = player.posY - task.lastInteractionY;
+            double dz = player.posZ - task.lastInteractionZ;
+            if (dx * dx + dy * dy + dz * dz > 0.0025D) task.interactionStallTicks = 0;
+            else task.interactionStallTicks++;
+        }
+        task.lastInteractionX = player.posX;
+        task.lastInteractionY = player.posY;
+        task.lastInteractionZ = player.posZ;
+        return task.interactionMoveTicks > MAX_INTERACTION_MOVE_TICKS || task.interactionStallTicks > 60;
+    }
+
+    private void resetInteractionMovement(ClientTask task) {
+        task.interactionMoveTicks = 0;
+        task.interactionStallTicks = 0;
+        task.lastInteractionX = Double.NaN;
+        task.lastInteractionY = Double.NaN;
+        task.lastInteractionZ = Double.NaN;
+    }
+
+    private boolean isAtInteractionPosition(EntityClientPlayerMP player, BlockPos position, BlockPos target,
+        double arriveSq) {
+        return distSq(player, target) <= arriveSq
+            || isInteractionBlock(position.x, position.y, position.z, target.x, target.y, target.z);
+    }
+
+    static boolean isInteractionBlock(int positionX, int positionY, int positionZ, int targetX, int targetY,
+        int targetZ) {
+        int horizontal = Math.abs(positionX - targetX) + Math.abs(positionZ - targetZ);
+        return horizontal == 1 && Math.abs(positionY - targetY) <= 1;
     }
 
     private EntityPlayer findPlayer(Minecraft mc, String name) {
@@ -1775,13 +2540,33 @@ public class ClientBotController {
         return Integer.parseInt(raw);
     }
 
+    private TrackedAction trackedAction(ClientTask task) {
+        return task == null || task.actionId == null ? null : trackedActions.get(task.actionId);
+    }
+
+    private String actionResponse(TrackedAction action) {
+        JsonObject response = new JsonObject();
+        response.addProperty("ok", true);
+        response.add("action", action.toJson());
+        return response.toString();
+    }
+
     private String norm(String in) {
-        return in == null ? ""
-            : in.toLowerCase()
-                .replace('_', ' ')
-                .replaceAll("[^a-z0-9: ]+", " ")
-                .replaceAll("\\s+", " ")
-                .trim();
+        if (in == null) return "";
+        String lower = in.toLowerCase();
+        StringBuilder out = new StringBuilder(lower.length());
+        boolean pendingSpace = false;
+        for (int i = 0; i < lower.length(); i++) {
+            char c = lower.charAt(i);
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == ':') {
+                if (pendingSpace && out.length() > 0) out.append(' ');
+                out.append(c);
+                pendingSpace = false;
+            } else {
+                pendingSpace = true;
+            }
+        }
+        return out.toString();
     }
 
     private static class ParsedCommand {
@@ -1812,12 +2597,51 @@ public class ClientBotController {
         CRAFT
     }
 
+    private enum CraftPhase {
+        NEW,
+        PLANNING,
+        SCANNING_STORAGE,
+        RETRIEVING,
+        EXECUTING
+    }
+
+    private enum CraftExecutionStage {
+        PREPARE_STATION,
+        CLEAR_GRID,
+        PLACE_INGREDIENTS,
+        WAIT_OUTPUT,
+        VERIFY_OUTPUT
+    }
+
     private static class ClientTask {
 
         private final TaskKind kind;
         private final int x, y, z, side, targetCount;
         private final String targetPlayer, itemQuery;
-        private int missingCooldown = 1;
+        private String actionId;
+        private CraftPhase craftPhase = CraftPhase.NEW;
+        private CraftPlan craftPlan;
+        private Queue<ChestKey> storageScanQueue = new ArrayDeque<ChestKey>();
+        private Map<StackKey, Integer> requiredChestItems = new HashMap<StackKey, Integer>();
+        private boolean storageScanCompleted;
+        private ChestKey activeChest;
+        private StackKey pendingRetrieval;
+        private int retrievalCountBefore;
+        private int phaseWaitTicks;
+        private int craftStepIndex;
+        private int craftRepeatIndex;
+        private int craftSlotIndex;
+        private CraftExecutionStage executionStage = CraftExecutionStage.PREPARE_STATION;
+        private BlockPos craftingTable;
+        private int outputCountBefore;
+        private int rejectedRecipeCount;
+        private String lastRejectedRecipeId;
+        private String craftMissing;
+        private int interactionMoveTicks;
+        private int interactionStallTicks;
+        private double lastInteractionX = Double.NaN;
+        private double lastInteractionY = Double.NaN;
+        private double lastInteractionZ = Double.NaN;
 
         private ClientTask(TaskKind k, int x, int y, int z, int side, String tp, String iq, int tc) {
             kind = k;
@@ -1858,17 +2682,6 @@ public class ClientBotController {
             if (kind == TaskKind.CRAFT) return "CRAFT(" + itemQuery + "," + targetCount + ")";
             if (kind == TaskKind.FOLLOW) return "FOLLOW(" + targetPlayer + ")";
             return kind.name() + "(" + x + "," + y + "," + z + ")";
-        }
-    }
-
-    private static class Ingredient {
-
-        private final ItemStack template;
-        private final int count;
-
-        private Ingredient(ItemStack t, int c) {
-            template = t;
-            count = c;
         }
     }
 
@@ -1967,23 +2780,32 @@ public class ClientBotController {
     private static class ChestSnapshot {
 
         private final Map<String, Integer> items;
+        private final Map<StackKey, Integer> exactItems;
         private final long updatedAtTick;
+        private final boolean trusted;
 
-        private ChestSnapshot(Map<String, Integer> items, long updatedAtTick) {
+        private ChestSnapshot(Map<String, Integer> items, long updatedAtTick, boolean trusted) {
+            this(items, new HashMap<StackKey, Integer>(), updatedAtTick, trusted);
+        }
+
+        private ChestSnapshot(Map<String, Integer> items, Map<StackKey, Integer> exactItems, long updatedAtTick,
+            boolean trusted) {
             this.items = items;
+            this.exactItems = exactItems;
             this.updatedAtTick = updatedAtTick;
+            this.trusted = trusted;
         }
 
         @Override
         public boolean equals(Object o) {
             if (!(o instanceof ChestSnapshot)) return false;
             ChestSnapshot s = (ChestSnapshot) o;
-            return items.equals(s.items);
+            return trusted == s.trusted && items.equals(s.items) && exactItems.equals(s.exactItems);
         }
 
         @Override
         public int hashCode() {
-            return items.hashCode();
+            return 31 * (31 * items.hashCode() + exactItems.hashCode()) + (trusted ? 1 : 0);
         }
     }
 
@@ -2061,17 +2883,6 @@ public class ClientBotController {
         }
     }
 
-    private static class RecipePlan {
-
-        private final ItemStack output;
-        private final List<Ingredient> ingredients;
-
-        private RecipePlan(ItemStack o, List<Ingredient> i) {
-            output = o;
-            ingredients = i;
-        }
-    }
-
     private static class BlockPos {
 
         private final int x, y, z;
@@ -2101,7 +2912,25 @@ public class ClientBotController {
     private static class AStarPathfinder {
 
         private static Queue<BlockPos> findPath(World world, BlockPos start, BlockPos goal, int maxNodes) {
-            if (start.equals(goal)) return new ArrayDeque<BlockPos>();
+            return findPath(world, start, goal, maxNodes, false);
+        }
+
+        private static Queue<BlockPos> findPathToInteraction(World world, BlockPos start, BlockPos target,
+            int maxNodes) {
+            return findPath(world, start, target, maxNodes, true);
+        }
+
+        private static Queue<BlockPos> findPath(World world, BlockPos start, BlockPos goal, int maxNodes,
+            boolean interactionTarget) {
+            BlockPos normalizedStart = normalizeStandPosition(world, start);
+            if (normalizedStart == null) return new ArrayDeque<BlockPos>();
+            start = normalizedStart;
+            if (!interactionTarget) {
+                BlockPos normalizedGoal = normalizeStandPosition(world, goal);
+                if (normalizedGoal == null) return new ArrayDeque<BlockPos>();
+                goal = normalizedGoal;
+            }
+            if (reached(start, goal, interactionTarget)) return new ArrayDeque<BlockPos>();
             PriorityQueue<PathNode> open = new PriorityQueue<PathNode>(64, new Comparator<PathNode>() {
 
                 @Override
@@ -2117,24 +2946,41 @@ public class ClientBotController {
             int expanded = 0;
             while (!open.isEmpty() && expanded < maxNodes) {
                 PathNode cur = open.poll();
-                if (cur.pos.equals(goal)) return build(cur);
+                if (reached(cur.pos, goal, interactionTarget)) return build(cur);
                 if (closed.contains(cur.pos)) continue;
                 closed.add(cur.pos);
                 expanded++;
                 int[][] dirs = new int[][] { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
                 for (int i = 0; i < dirs.length; i++) {
-                    BlockPos next = new BlockPos(cur.pos.x + dirs[i][0], cur.pos.y, cur.pos.z + dirs[i][1]);
-                    if (!canStand(world, next) || closed.contains(next)) continue;
-                    int g = cur.g + 1;
-                    PathNode seen = nodes.get(next);
-                    if (seen == null || g < seen.g) {
-                        PathNode n = new PathNode(next, cur, g, h(next, goal));
-                        nodes.put(next, n);
-                        open.add(n);
+                    int[] levels = new int[] { cur.pos.y, cur.pos.y + 1, cur.pos.y - 1 };
+                    for (int j = 0; j < levels.length; j++) {
+                        BlockPos next = new BlockPos(cur.pos.x + dirs[i][0], levels[j], cur.pos.z + dirs[i][1]);
+                        if (!canStand(world, next) || closed.contains(next)) continue;
+                        int g = cur.g + 1 + Math.abs(next.y - cur.pos.y);
+                        PathNode seen = nodes.get(next);
+                        if (seen == null || g < seen.g) {
+                            PathNode n = new PathNode(next, cur, g, h(next, goal));
+                            nodes.put(next, n);
+                            open.add(n);
+                        }
                     }
                 }
             }
             return new ArrayDeque<BlockPos>();
+        }
+
+        private static BlockPos normalizeStandPosition(World world, BlockPos requested) {
+            int[] offsets = new int[] { 0, -1, 1, -2, 2 };
+            for (int i = 0; i < offsets.length; i++) {
+                BlockPos candidate = new BlockPos(requested.x, requested.y + offsets[i], requested.z);
+                if (canStand(world, candidate)) return candidate;
+            }
+            return null;
+        }
+
+        private static boolean reached(BlockPos position, BlockPos target, boolean interactionTarget) {
+            if (!interactionTarget) return position.equals(target);
+            return isInteractionBlock(position.x, position.y, position.z, target.x, target.y, target.z);
         }
 
         private static boolean canStand(World world, BlockPos p) {
