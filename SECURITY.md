@@ -6,7 +6,7 @@ Only the latest release is supported while the project is pre-1.0.
 
 ## Report a vulnerability
 
-Do not open a public issue for authentication bypasses, unsafe game-action execution, credential exposure, or remote-access vulnerabilities. Contact the maintainer privately through GitHub Security Advisories after the repository is published.
+Do not open a public issue for authentication bypasses, unsafe game-action execution, credential exposure, or remote-access vulnerabilities. Use **Report a vulnerability** on the repository's [Security Advisories](https://github.com/tim025-star/gtnh-ai-bot/security/advisories) page to contact the maintainer privately.
 
 Include reproduction steps, affected version, impact, and any suggested mitigation. Please allow reasonable time for investigation before disclosure.
 

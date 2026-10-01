@@ -1,108 +1,42 @@
-# companion
+# GTNH AI Bot companion
 
-This project was created with [Better-T-Stack](https://github.com/AmanVarshney01/create-better-t-stack), a modern TypeScript stack that combines React, TanStack Router, Hono, TRPC, and more.
+This workspace contains the local dashboard and planning service for [GTNH AI Bot](../README.md). The Minecraft mod observes the world and executes game actions; the companion connects the player, the mod, and the official Codex app-server.
 
-## Features
+See the [project README](../README.md) for the project's goal, current capabilities, requirements, and limitations.
 
-- **TypeScript** - For type safety and improved developer experience
-- **TanStack Router** - File-based routing with full type safety
-- **TailwindCSS** - Utility-first CSS for rapid UI development
-- **Shared UI package** - shadcn/ui primitives live in `packages/ui`
-- **Hono** - Lightweight, performant server framework
-- **tRPC** - End-to-end type-safe APIs
-- **Node.js** - Runtime environment
-- **Drizzle** - TypeScript-first ORM
-- **SQLite/Turso** - Database engine
-- **Biome** - Linting and formatting
+## Run for development
 
-## Getting Started
+Use Node.js 24 and the pnpm version pinned in `package.json`.
 
-First, install the dependencies:
-
-```bash
-pnpm install
+```powershell
+pnpm install --frozen-lockfile
+pnpm dev
 ```
 
-## Database Setup
+Open the dashboard at [http://127.0.0.1:3001](http://127.0.0.1:3001). The API listens on [http://127.0.0.1:3000](http://127.0.0.1:3000). Install and launch the Minecraft mod, run `/gtnhbot pair`, and enter the pairing code in the dashboard. Sign in through Codex to use AI goals.
 
-This project uses SQLite with Drizzle ORM.
+The companion creates its local SQLite tables on startup. The `.env.example` files show the development defaults. Keep credentials, local databases, and Codex account files out of Git.
 
-1. Start the local SQLite database (optional):
+## Workspace layout
 
-```bash
-pnpm run db:local
+- `apps/web`: React dashboard, manual controls, goal progress, and settings.
+- `apps/server`: Hono HTTP server with host/origin checks and tRPC routes.
+- `packages/api`: Validated action contracts, goal lifecycle, Minecraft bridge client, Codex process management, and GTNH knowledge lookup.
+- `packages/db`: SQLite schema, settings, run history, and cached knowledge.
+- `packages/env`: Validated configuration and loopback defaults.
+- `packages/ui`: Shared UI primitives and styles.
+- `packages/config`: Shared TypeScript configuration.
+
+The workspace started from [Better-T-Stack](https://github.com/AmanVarshney01/create-better-t-stack).
+
+## Checks and build
+
+```powershell
+pnpm check
+pnpm check-types
+pnpm test
+pnpm audit --prod
+pnpm build
 ```
 
-2. Update your `.env` file in the `apps/server` directory with the appropriate connection details if needed.
-
-3. Apply the schema to your database:
-
-```bash
-pnpm run db:push
-```
-
-Then, run the development server:
-
-```bash
-pnpm run dev
-```
-
-Open [http://localhost:3001](http://localhost:3001) in your browser to see the web application.
-The API is running at [http://localhost:3000](http://localhost:3000).
-
-## UI Customization
-
-React web apps in this stack share shadcn/ui primitives through `packages/ui`.
-
-- Change design tokens and global styles in `packages/ui/src/styles/globals.css`
-- Update shared primitives in `packages/ui/src/components/*`
-- Adjust shadcn aliases or style config in `packages/ui/components.json` and `apps/web/components.json`
-
-### Add more shared components
-
-Run this from the project root to add more primitives to the shared UI package:
-
-```bash
-npx shadcn@latest add accordion dialog popover sheet table -c packages/ui
-```
-
-Import shared components like this:
-
-```tsx
-import { Button } from "@companion/ui/components/button";
-```
-
-### Add app-specific blocks
-
-If you want to add app-specific blocks instead of shared primitives, run the shadcn CLI from `apps/web`.
-
-## Git Hooks and Formatting
-
-- Run checks: `pnpm run check`
-
-## Project Structure
-
-```
-companion/
-├── apps/
-│   ├── web/         # Frontend application (React + TanStack Router)
-│   └── server/      # Backend API (Hono, TRPC)
-├── packages/
-│   ├── ui/          # Shared shadcn/ui components and styles
-│   ├── api/         # API layer / business logic
-│   └── db/          # Database schema & queries
-```
-
-## Available Scripts
-
-- `pnpm run dev`: Start all applications in development mode
-- `pnpm run build`: Build all applications
-- `pnpm run dev:web`: Start only the web application
-- `pnpm run dev:server`: Start only the server
-- `pnpm run check-types`: Check TypeScript types across all apps
-- `pnpm run db:push`: Push schema changes to database
-- `pnpm run db:generate`: Generate database client/types
-- `pnpm run db:migrate`: Run database migrations
-- `pnpm run db:studio`: Open database studio UI
-- `pnpm run db:local`: Start the local SQLite database
-- `pnpm run check`: Run Biome formatting and linting
+See [Architecture](../docs/ARCHITECTURE.md) for the trust boundaries and data flow, and [Contributing](../CONTRIBUTING.md) for development expectations.

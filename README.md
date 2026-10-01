@@ -1,10 +1,42 @@
 # GTNH AI Bot
 
-GTNH AI Bot is a local-first automation mod and control dashboard for GT New Horizons on Minecraft 1.7.10. The Minecraft client owns all world observation, validation, and action execution. A TypeScript companion provides the web dashboard, durable run history, sourced GTNH knowledge, and optional planning through the official Codex app-server.
+[![CI](https://github.com/tim025-star/gtnh-ai-bot/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tim025-star/gtnh-ai-bot/actions/workflows/ci.yml)
 
-> This is an early release. Automation can move the player, craft items, and interact with blocks. Back up your world and supervise destructive goals.
+GTNH AI Bot is an experimental AI assistant for **GT New Horizons (GTNH)**, the Minecraft 1.7.10 modpack. It combines a client-side Forge mod with a local web dashboard. You give it a goal in plain English, the AI plans an action using the observed game state, and the mod validates and executes that action inside Minecraft.
+
+The companion uses the official Codex app-server for AI planning, with ChatGPT sign-in or an OpenAI Platform API key. You can also control the bot through typed dashboard actions and in-game commands.
+
+## My goal for this project
+
+My goal is to build a bot that can turn a plain-English goal into useful progress in GTNH. It needs to understand what the player has, what a recipe needs, where the ingredients are, which actions it can take, and whether those actions worked.
+
+I want to grow this from basic movement and crafting into a bot that can plan longer recipe chains, work with GTNH machines, and handle more of the modpack's progression. The player should be able to see what it is doing, set limits, interrupt it, and take back control at any time.
+
+## Current status
+
+This is an **early experimental source release**. The mod and companion build and pass their automated checks. Real GTNH gameplay verification remains a release gate, so treat the current implementation as something to test and develop.
+
+The current implementation includes:
+
+- Manual movement, following, block interaction, item selection, and recipe diagnosis.
+- AI goal planning with step, action, and time limits, pause/cancel controls, and persistent run history. The companion waits for an action's result before planning the next step.
+- Crafting plans using loaded recipes, the player's inventory, and nearby chest contents. Execution currently supports the player grid and vanilla crafting tables.
+- Local pairing and loopback-only connections. In-game commands can interrupt AI control.
+
+Furnace and GregTech recipes are available for diagnosis. Machine crafting, custom workbench containers, tunnelling, and bridging still need implementation.
+
+> Back up your world and supervise the bot. Its actions can move the player, consume items, and change blocks. Use it on servers only where the server's rules allow automation.
+
+## Where I want to take it
+
+1. Verify and improve movement, chest retrieval, and crafting in real GTNH sessions.
+2. Expand crafting support to GTNH machines and their inventory interactions.
+3. Plan and execute longer chains of tasks with useful progress and failure reporting.
+4. Build toward broader GTNH progression while keeping player control and explicit limits.
 
 ## Architecture
+
+The Minecraft client owns world observation, validation, and action execution. The TypeScript companion provides the dashboard, saved run history, sourced GTNH knowledge, and AI planning.
 
 ```text
 Browser on 127.0.0.1
