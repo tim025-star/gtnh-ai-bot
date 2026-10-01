@@ -28,6 +28,9 @@ jobs:
       - name: Verify companion
         working-directory: companion
         run: pnpm check && pnpm check-types && pnpm test && pnpm build
+      - name: Audit production dependencies
+        working-directory: companion
+        run: pnpm audit --prod
       - name: Verify mod
         run: .\gradlew.bat --no-configuration-cache test build
       - name: Check public tree
